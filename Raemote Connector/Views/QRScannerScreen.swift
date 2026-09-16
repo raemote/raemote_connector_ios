@@ -17,13 +17,20 @@ extension Notification.Name {
 struct QRScannerScreen: View {
     @State private var isPresented = true
     @State private var scannedCode: String?
+    /// The camera isn't available (denied or restricted); explain instead of
+    /// vanishing.
+    @State private var permissionDenied = false
 
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
 
-            QRScannerView(isPresented: $isPresented, scannedCode: $scannedCode)
-                .ignoresSafeArea()
+            QRScannerView(
+                isPresented: $isPresented,
+                scannedCode: $scannedCode,
+                permissionDenied: $permissionDenied
+            )
+            .ignoresSafeArea()
 
             VStack {
                 Spacer()
@@ -43,8 +50,7 @@ struct QRScannerScreen: View {
 
                 Button {
                     print("[QRScannerScreen] cancelled")
-                    NotificationCenter.default.post(name: .qrScannerCancelled, object: nil)
-                    ScannerPresentation.dismiss()
+                    dismiss()
                 } label: {
                     Text("Cancel")
                         .font(.headline)
@@ -56,11 +62,28 @@ struct QRScannerScreen: View {
                 .padding(.bottom, 40)
             }
         }
+        .alert("Camera Access Needed", isPresented: $permissionDenied) {
+            Button("Open Settings") {
+                if let url = URL(string: UIApplication.openSettingsURLString) {
+                    UIApplication.shared.open(url)
+                }
+                dismiss()
+            }
+            Button("Cancel", role: .cancel) { dismiss() }
+        } message: {
+            Text("Raemote needs the camera to scan the server's pairing QR code. Allow camera access for Raemote in Settings, then try again — or paste the pairing link with Manual Setup instead.")
+        }
         .onChange(of: scannedCode) { _, value in
             guard let value else { return }
             print("[QRScannerScreen] scanned, notifying")
             NotificationCenter.default.post(name: .qrScannerScanned, object: value)
             ScannerPresentation.dismiss()
         }
+    }
+
+    /// Dismiss the scanner and tell the presenter it was cancelled.
+    private func dismiss() {
+        NotificationCenter.default.post(name: .qrScannerCancelled, object: nil)
+        ScannerPresentation.dismiss()
     }
 }

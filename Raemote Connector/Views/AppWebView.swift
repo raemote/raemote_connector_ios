@@ -24,6 +24,11 @@ final class WebViewState {
     /// The web view is in true (element) fullscreen; hide the control then.
     var isFullscreen = false
     var isPreparingShare = false
+    /// The file currently downloading from the page, if any. Shown in the busy
+    /// banner so a download in flight is never invisible.
+    var downloadingFileName: String?
+    /// How many downloads are running (several can overlap); not observed.
+    @ObservationIgnored var activeDownloadCount = 0
     var shareRequest: ShareRequest?
     var shareError: String?
 
@@ -39,6 +44,16 @@ final class WebViewState {
 
     func goForward() {
         webView?.goForward()
+    }
+
+    func downloadStarted(named name: String) {
+        activeDownloadCount += 1
+        downloadingFileName = name
+    }
+
+    func downloadFinished() {
+        activeDownloadCount = max(0, activeDownloadCount - 1)
+        if activeDownloadCount == 0 { downloadingFileName = nil }
     }
 }
 
@@ -77,6 +92,33 @@ struct AppWebView: View {
     /// What to call this app: the page title learned from the web view, else the
     /// server's name for it.
     private var displayName: String { learnedName ?? app.name }
+
+    /// What the page is busy doing, if anything.
+    private var busyText: String? {
+        if let name = state.downloadingFileName { return "Downloading \(name)…" }
+        if state.isPreparingShare { return "Preparing to share…" }
+        return nil
+    }
+
+    /// A small banner across the top of the page, so a download or a share that
+    /// takes time is visible while the floating card is collapsed.
+    private func busyBanner(_ text: String) -> some View {
+        HStack(spacing: 8) {
+            ProgressView()
+                .controlSize(.small)
+            Text(text)
+                .font(.footnote.weight(.medium))
+                .lineLimit(1)
+                .truncationMode(.middle)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .glassSurface(Capsule())
+        .padding(.top, 10)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(text)
+    }
 
     var body: some View {
         @Bindable var state = state
@@ -122,7 +164,16 @@ struct AppWebView: View {
                 if proxyURL != nil, !state.isFullscreen {
                     floatingControl(in: geometry.size)
                 }
+
+                // Any operation that takes time announces itself here: the
+                // floating card collapses when it starts one, so its own
+                // spinner would be hidden.
+                if let busyText {
+                    busyBanner(busyText)
+                        .transition(.move(edge: .top).combined(with: .opacity))
+                }
             }
+            .animation(.snappy(duration: 0.25), value: busyText)
             .frame(width: geometry.size.width, height: geometry.size.height)
         }
         // Paint the safe-area bands (notch, home indicator) the same colour the
@@ -858,15 +909,22 @@ struct WebViewRepresentable: UIViewRepresentable {
             let dest = (dir ?? FileManager.default.temporaryDirectory).appendingPathComponent(name)
             try? FileManager.default.removeItem(at: dest)
             downloadDestinations[ObjectIdentifier(download)] = dest
+            DispatchQueue.main.async {
+                self.parent.state.downloadStarted(named: name)
+            }
             completionHandler(dest)
         }
 
         func downloadDidFinish(_ download: WKDownload) {
             let dest = downloadDestinations.removeValue(forKey: ObjectIdentifier(download))
                 ?? download.progress.fileURL
-            guard let dest else { return }
             DispatchQueue.main.async {
-                self.parent.state.shareRequest = ShareRequest(items: [dest])
+                // Clear the banner first: `dest` can be nil, and the indicator
+                // must not be left behind.
+                self.parent.state.downloadFinished()
+                if let dest {
+                    self.parent.state.shareRequest = ShareRequest(items: [dest])
+                }
             }
         }
 
@@ -877,6 +935,7 @@ struct WebViewRepresentable: UIViewRepresentable {
         ) {
             downloadDestinations.removeValue(forKey: ObjectIdentifier(download))
             DispatchQueue.main.async {
+                self.parent.state.downloadFinished()
                 self.parent.state.shareError = error.localizedDescription
             }
         }

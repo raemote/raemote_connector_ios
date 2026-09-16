@@ -23,8 +23,8 @@
 /* Begin PBXFileReference section */
 		000000000000000000000120 /* Raemote Connector.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Raemote Connector.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 		A3E078F63052B78100ADB176 /* RaemoteConnectorTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = RaemoteConnectorTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
-		A3E0790A3052B78100ADB176 /* Config/Shared.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Shared.xcconfig; sourceTree = "<group>"; };
-		A3E0790B3052B78100ADB176 /* Config/Local.xcconfig.example */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Local.xcconfig.example; sourceTree = "<group>"; };
+		A3E0790A3052B78100ADB176 /* Shared.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Shared.xcconfig; sourceTree = "<group>"; };
+		A3E0790B3052B78100ADB176 /* Local.xcconfig.example */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Local.xcconfig.example; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -77,8 +77,8 @@
 		A3E0790C3052B78100ADB176 /* Config */ = {
 			isa = PBXGroup;
 			children = (
-				A3E0790A3052B78100ADB176 /* Config/Shared.xcconfig */,
-				A3E0790B3052B78100ADB176 /* Config/Local.xcconfig.example */,
+				A3E0790A3052B78100ADB176 /* Shared.xcconfig */,
+				A3E0790B3052B78100ADB176 /* Local.xcconfig.example */,
 			);
 			path = Config;
 			sourceTree = "<group>";
@@ -207,7 +207,7 @@
 /* Begin XCBuildConfiguration section */
 		000000000000000011000000 /* Debug configuration for PBXProject "Raemote Connector" */ = {
 			isa = XCBuildConfiguration;
-			baseConfigurationReference = A3E0790A3052B78100ADB176 /* Config/Shared.xcconfig */;
+			baseConfigurationReference = A3E0790A3052B78100ADB176 /* Shared.xcconfig */;
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
 				APPLETVOS_DEPLOYMENT_TARGET = 27.0;
@@ -278,7 +278,7 @@
 		};
 		000000000000000012000000 /* Release configuration for PBXProject "Raemote Connector" */ = {
 			isa = XCBuildConfiguration;
-			baseConfigurationReference = A3E0790A3052B78100ADB176 /* Config/Shared.xcconfig */;
+			baseConfigurationReference = A3E0790A3052B78100ADB176 /* Shared.xcconfig */;
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
 				APPLETVOS_DEPLOYMENT_TARGET = 27.0;

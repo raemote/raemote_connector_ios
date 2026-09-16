@@ -20,6 +20,8 @@ struct ServerDetailView: View {
     /// snapshot) so the title reflects a name fetched after this view appeared.
     @State private var reportedName: String?
     @State private var isRefreshing = false
+    /// An invitation is being minted (may reconnect first); shows progress.
+    @State private var isCreatingInvitation = false
     @State private var refreshError: String?
     @State private var showRename = false
     @State private var renameText = ""
@@ -114,8 +116,11 @@ struct ServerDetailView: View {
                     Button("Invite Device…", systemImage: "person.badge.plus") {
                         Task { await createInvitation() }
                     }
+                    .disabled(isCreatingInvitation || isRefreshing)
                 } label: {
-                    if isRefreshing {
+                    // Any server action in flight spins the icon, so it is
+                    // always obvious that something is happening.
+                    if isRefreshing || isCreatingInvitation {
                         ProgressView()
                     } else {
                         Image(systemName: "ellipsis")
@@ -205,7 +210,15 @@ struct ServerDetailView: View {
     }
 
     /// Mint a one-time invitation and present it as a QR/link sheet.
+    ///
+    /// Can take a few seconds — it may reconnect first and then round-trips to
+    /// the server — so it runs behind `isCreatingInvitation`, which disables the
+    /// menu item and spins the toolbar icon.
     private func createInvitation() async {
+        guard !isCreatingInvitation else { return }
+        isCreatingInvitation = true
+        defer { isCreatingInvitation = false }
+
         await irohService.validateConnection(nodeId: server.nodeId)
         guard case .connected = monitor.state else {
             refreshError = "Not connected to the server. Try again once it reconnects."
@@ -290,7 +303,9 @@ struct ServerDetailView: View {
         case .connected: return "Connected"
         case .connecting: return "Connecting…"
         case .disconnected: return "Disconnected"
-        case .unknown: return "Unknown"
+        // Before the first check the state is genuinely unknown; say so in a
+        // way that reads as "working on it" rather than as a failure.
+        case .unknown: return "Checking…"
         }
     }
 

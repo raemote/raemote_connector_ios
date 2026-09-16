@@ -22,12 +22,19 @@ final class QRPreviewView: UIView {
 ///
 /// Set `scannedCode` when detection succeeds and `isPresented` back to `false`
 /// to dismiss. The session is stopped automatically when the view goes away.
+/// If the camera can't be used, `permissionDenied` is set instead of dismissing
+/// silently, so the caller can explain why.
 struct QRScannerView: UIViewRepresentable {
     @Binding var isPresented: Bool
     @Binding var scannedCode: String?
+    @Binding var permissionDenied: Bool
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(isPresented: $isPresented, scannedCode: $scannedCode)
+        Coordinator(
+            isPresented: $isPresented,
+            scannedCode: $scannedCode,
+            permissionDenied: $permissionDenied
+        )
     }
 
     func makeUIView(context: Context) -> QRPreviewView {
@@ -50,10 +57,16 @@ struct QRScannerView: UIViewRepresentable {
 
         private let isPresented: Binding<Bool>
         private let scannedCode: Binding<String?>
+        private let permissionDenied: Binding<Bool>
 
-        init(isPresented: Binding<Bool>, scannedCode: Binding<String?>) {
+        init(
+            isPresented: Binding<Bool>,
+            scannedCode: Binding<String?>,
+            permissionDenied: Binding<Bool>
+        ) {
             self.isPresented = isPresented
             self.scannedCode = scannedCode
+            self.permissionDenied = permissionDenied
             super.init()
         }
 
@@ -78,7 +91,9 @@ struct QRScannerView: UIViewRepresentable {
             let authorized = await ensurePermission()
             print("[QRScanner] camera authorized: \(authorized)")
             guard authorized else {
-                await MainActor.run { isPresented.wrappedValue = false }
+                // The caller explains this; dismissing here would look like a
+                // crash. The screen keeps its own Cancel button.
+                await MainActor.run { permissionDenied.wrappedValue = true }
                 return
             }
 
