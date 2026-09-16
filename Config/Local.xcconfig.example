@@ -1,0 +1,13 @@
+// Copy this file to Local.xcconfig (in the same directory) and fill in your own
+// values. Local.xcconfig is gitignored, so your identifiers stay private.
+//
+//   cp Config/Local.xcconfig.example Config/Local.xcconfig
+
+// Your app's bundle identifier: any reverse-DNS string that is unique to you.
+// Raemote Connector uses it for the Keychain entry that holds this device's
+// identity, so pick one and keep using it.
+RAEMOTE_BUNDLE_ID = com.yourname.raemote
+
+// Your Apple Developer team id, needed only to run on a physical device
+// (Xcode > Settings > Accounts > your team). Leave it empty for the Simulator.
+RAEMOTE_DEVELOPMENT_TEAM = ABCDE12345

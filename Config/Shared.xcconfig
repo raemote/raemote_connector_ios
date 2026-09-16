@@ -1,0 +1,13 @@
+// Shared build settings for Raemote Connector.
+//
+// Account- and machine-specific values — your bundle identifier and your Apple
+// Developer team — live in an *optional* Local.xcconfig beside this file, which
+// is gitignored so they are never published. Copy Local.xcconfig.example to
+// Local.xcconfig and fill it in; see BUILDING.md.
+//
+// The placeholders below let a fresh clone build for the Simulator as-is.
+
+RAEMOTE_BUNDLE_ID = com.example.raemote
+RAEMOTE_DEVELOPMENT_TEAM =
+
+#include? "Local.xcconfig"

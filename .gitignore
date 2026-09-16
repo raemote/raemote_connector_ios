@@ -1,0 +1,21 @@
+# Xcode
+build/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+
+# Swift Package Manager
+.build/
+.swiftpm/
+
+# Local, machine-specific build settings (bundle id, Apple team). See
+# Config/Local.xcconfig.example.
+Config/Local.xcconfig
+
+# macOS
+.DS_Store
+
+# Deliberately float to the latest upstream iroh-ffi within the major version,
+# so the resolution isn't pinned here. Commit this instead if a reproducible
+# build ever matters more than picking up upstream fixes automatically.
+Raemote Connector.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved
