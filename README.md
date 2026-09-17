@@ -6,6 +6,8 @@ finds, and opens them over an end-to-end encrypted
 [iroh](https://www.iroh.computer/) connection — from any network, with no port
 forwarding and no account.
 
+Join TestFlight [here](https://testflight.apple.com/join/3AQeWyUR).
+
 ## Build
 
 ```sh
