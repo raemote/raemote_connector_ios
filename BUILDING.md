@@ -14,8 +14,8 @@ see "What you need" below.
 ## Steps
 
 ```sh
-git clone https://github.com/raemote/raemote_ios.git
-cd raemote_ios/Raemote\ Connector
+git clone https://github.com/raemote/raemote_connector_ios.git
+cd raemote_connector_ios
 cp Config/Local.xcconfig.example Config/Local.xcconfig     # then edit it
 open "Raemote Connector.xcodeproj"
 ```

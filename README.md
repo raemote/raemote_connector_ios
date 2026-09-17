@@ -1,61 +1,39 @@
 # Raemote Connector (iOS)
 
-The iPhone/iPad client for [Raemote](https://github.com/raemote/raemote_server):
-it pairs with a Raemote server running on a computer you own, lists the web apps
-that server discovers, and opens them over a direct, end-to-end encrypted iroh
-connection — from any network, with no port forwarding and no account.
+The iPhone/iPad client for [Raemote](https://github.com/raemote/raemote_server).
+It pairs with a Raemote server on your computer, lists the web apps that server
+finds, and opens them over an end-to-end encrypted
+[iroh](https://www.iroh.computer/) connection — from any network, with no port
+forwarding and no account.
 
-Pairing is a QR code or a `raemote://bind?...` link printed by the server. Once
-paired, the phone remembers the server and can reach it from anywhere.
-
-## What it does
-
-- Binds a real **iroh** endpoint with a persistent identity kept in the Keychain.
-- Pairs by scanning the server's QR code (or pasting the link).
-- Fetches the server's app catalog over iroh and renders each app in a `WKWebView`
-  through an in-app loopback proxy that relays over iroh.
-- Keeps a stable per-app origin, so cookies, `localStorage` and site data survive
-  relaunches.
-- Shows whether the transport is direct or relayed, and invites another device to
-  pair with the same server.
-
-## Requirements
-
-- macOS with **Xcode 27** or newer (the app targets iOS 27).
-- Network access the first time you build: the `iroh-ffi` Swift package is
-  fetched from GitHub.
-- To run on a physical device: your own Apple Developer team id (a free Apple ID
-  works — the app uses no special entitlements).
-
-## Building
-
-See **[BUILDING.md](BUILDING.md)** — it is short, and covers the two values you
-supply (your bundle identifier and Apple team) and the fact that no keys, tokens
-or other secrets are needed.
-
-Quick version:
+## Build
 
 ```sh
-cp Config/Local.xcconfig.example Config/Local.xcconfig   # then edit it
+git clone https://github.com/raemote/raemote_connector_ios.git
+cd raemote_connector_ios
+cp Config/Local.xcconfig.example Config/Local.xcconfig   # your bundle id + Apple team
 open "Raemote Connector.xcodeproj"
 ```
 
-Command line:
+Xcode 27 or newer (the app targets iOS 27). The `iroh-ffi` package is fetched
+from GitHub on the first build, and **no keys, tokens or certificates are
+needed** — [BUILDING.md](BUILDING.md) covers the two values you supply, plus the
+command-line build and test.
 
-```sh
-xcodebuild -project "Raemote Connector.xcodeproj" -scheme "Raemote Connector" \
-  -destination 'generic/platform=iOS Simulator' build
-xcodebuild -project "Raemote Connector.xcodeproj" -scheme "Raemote Connector" \
-  -destination 'platform=iOS Simulator,name=iPhone 17' test
-```
+## What it does
 
-## Relationship to the server
+- Keeps a persistent device identity in the Keychain; pairs once, by QR code or
+  link.
+- Opens each app in a `WKWebView` through an in-app loopback proxy with a stable
+  per-app origin, so logins and site data survive relaunches.
+- Shows whether the connection is direct or relayed, and can invite another
+  device to the same server.
 
-This app is a client: it needs a Raemote server to be useful. The server is in
-[raemote/raemote_server](https://github.com/raemote/raemote_server) and installs
-with a one-liner. The two speak a small HTTP-over-iroh API (`raemote/bind/0` for
-pairing, `raemote/0` for the API and app proxying).
+It needs a server to be useful:
+[raemote/raemote_server](https://github.com/raemote/raemote_server) installs with
+one command.
 
-## License
+## Docs and license
 
-AGPL-3.0-or-later — see [LICENSE](LICENSE). The server is licensed the same way.
+[BUILDING.md](BUILDING.md) · [SECURITY.md](SECURITY.md) · [PRIVACY.md](PRIVACY.md)
+· AGPL-3.0-or-later — see [LICENSE](LICENSE).
