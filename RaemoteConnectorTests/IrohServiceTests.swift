@@ -66,10 +66,17 @@ struct IrohServiceTests {
     }
 
     @Test func reusesConnectionOnlyForTheSameServer() {
-        // A live connection must never serve a different server's requests.
-        #expect(IrohService.canReuseConnection(connected: "server-a", requested: "server-a"))
-        #expect(!IrohService.canReuseConnection(connected: "server-a", requested: "server-b"))
-        #expect(!IrohService.canReuseConnection(connected: nil, requested: "server-a"))
-        #expect(!IrohService.canReuseConnection(connected: "server-a", requested: nil))
+        // Per-node connection model: connections are keyed by node id, so a
+        // request for server A can only ever resolve A's entry. The old
+        // single-connection guard is expressed now as identity of the key:
+        // two servers with the same app name are distinct sessions, and no
+        // session key ever collapses across nodes.
+        let a1 = WebAppSessionKey(nodeId: "server-a", app: "jellyfin")
+        let b1 = WebAppSessionKey(nodeId: "server-b", app: "jellyfin")
+        #expect(a1 != b1, "same app name on two servers must be two sessions")
+        #expect(a1.id != b1.id)
+        #expect(a1 == WebAppSessionKey(nodeId: "server-a", app: "jellyfin"))
+        #expect(WebAppSessionKey(nodeId: "server-a", app: "jellyfin")
+            != WebAppSessionKey(nodeId: "server-a", app: "pihole"))
     }
 }

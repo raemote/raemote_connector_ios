@@ -1,5 +1,17 @@
 import SwiftUI
 
+/// A pushable route for a web app, registered at the ROOT of the navigation
+/// stack so the running-apps list (and any cross-session switch) can present
+/// the app directly — without first walking through the server's detail view.
+/// Distinct from `AppInfo` (whose destination lives inside `ServerDetailView`)
+/// so both can coexist in one stack without colliding destinations.
+struct RunningAppRoute: Hashable {
+    let nodeId: String
+    let app: String
+    /// Upstream app port, display only (`0` when unknown/offline).
+    let port: Int
+}
+
 struct ContentView: View {
     @State private var servers: [Server] = []
     @State private var isBinding = false
@@ -13,6 +25,9 @@ struct ContentView: View {
     @State private var inputError: String?
     @State private var connectionMonitor: IrohConnectionMonitor
     @State private var irohService: IrohService
+    /// Registry of simultaneously running web apps (cap 5, LRU eviction);
+    /// sessions keep running when the user navigates away from them.
+    @State private var sessionManager: WebAppSessionManager
     @State private var path = NavigationPath()
     @State private var pendingDeepLink: DeepLink?
     /// Set once after the first successful pairing, to show the network tip.
@@ -22,13 +37,20 @@ struct ContentView: View {
 
     init() {
         let monitor = IrohConnectionMonitor()
+        let service = IrohService(monitor: monitor)
         _connectionMonitor = State(initialValue: monitor)
-        _irohService = State(initialValue: IrohService(monitor: monitor))
+        _irohService = State(initialValue: service)
+        _sessionManager = State(initialValue: WebAppSessionManager(service: service))
     }
 
     var body: some View {
         NavigationStack(path: $path) {
             List {
+                // Live running apps across all paired servers; tap to resume
+                // (warm), swipe to close the session (site data is kept).
+                if !sessionManager.running.isEmpty {
+                    runningSection
+                }
                 if servers.isEmpty {
                     ContentUnavailableView(
                         "No Servers Yet",
@@ -45,11 +67,15 @@ struct ContentView: View {
                 }
             }
             .navigationTitle("Raemote")
+            .navigationDestination(for: RunningAppRoute.self) { route in
+                appRouteView(route)
+            }
             .navigationDestination(for: Server.self) { server in
                 ServerDetailView(
                     server: server,
                     irohService: irohService,
                     monitor: connectionMonitor,
+                    sessionManager: sessionManager,
                     onAppsUpdated: { apps in
                         updateServerApps(nodeId: server.nodeId, apps: apps)
                     },
@@ -58,6 +84,9 @@ struct ContentView: View {
                     },
                     onReportedName: { name in
                         updateServerReportedName(nodeId: server.nodeId, reportedName: name)
+                    },
+                    onSwitchSession: { key in
+                        openRunningSession(key)
                     }
                 )
             }
@@ -107,6 +136,17 @@ struct ContentView: View {
                 Button("Got it") { firstPairingName = nil }
             } message: {
                 Text("You're paired — Raemote reaches this server from anywhere, with no port forwarding or VPN.\n\nIt's worth confirming in your setup: switch between Wi-Fi and cellular and open the server on each. The first connection on a new network can take a few seconds while your devices find a path to each other.")
+            }
+            .alert("Pair to this server?", isPresented: .constant(pendingPairing != nil)) {
+                Button("Pair") {
+                    if let pending = pendingPairing {
+                        pendingPairing = nil
+                        beginBinding(nodeId: pending.nodeId, token: pending.token)
+                    }
+                }
+                Button("Cancel", role: .cancel) { pendingPairing = nil }
+            } message: {
+                Text("This will connect to the server whose identity ends in …\(pendingPairing?.nodeId.suffix(8) ?? ""). Only continue if you scanned the QR from your own machine or got its link directly.")
             }
             .sheet(isPresented: $showManualSetup) {
                 manualSetupSheet
@@ -197,7 +237,13 @@ struct ContentView: View {
 
     // MARK: - Actions
 
-    /// Parse the pasted/scanned link and start pairing.
+    /// A parsed pairing URI awaiting the user's confirmation. Pairing must
+    /// never start without showing which node the user is about to trust: a
+    /// decoy QR/link otherwise enrolls the phone on an attacker's server
+    /// silently (target identity only appears after a successful bind).
+    @State private var pendingPairing: (nodeId: String, token: String)?
+
+    /// Parse the pasted/scanned link and stage pairing for confirmation.
     private func startBinding() {
         let trimmed = uriInput.trimmingCharacters(in: .whitespacesAndNewlines)
 
@@ -207,7 +253,7 @@ struct ContentView: View {
         }
 
         showManualSetup = false
-        beginBinding(nodeId: nodeId, token: token)
+        pendingPairing = (nodeId: nodeId, token: token)
     }
 
     /// Pair in the background. There is no hard timeout: after 15s the overlay
@@ -237,7 +283,7 @@ struct ContentView: View {
                 print("[ContentView] binding to node \(nodeId.prefix(16))...")
                 try await irohService.bind(serverNodeId: nodeId, token: token)
                 print("[ContentView] fetching catalog...")
-                let apps = try await irohService.fetchCatalog()
+                let apps = try await irohService.fetchCatalog(nodeId: nodeId)
                 print("[ContentView] got \(apps.count) app(s): \(apps.map(\.name))")
 
                 let existing = servers.first(where: { $0.nodeId == nodeId })
@@ -248,7 +294,7 @@ struct ContentView: View {
                     apps: apps
                 )
                 // Ask the server for its own name (best effort).
-                if let info = try? await irohService.fetchServerInfo(), !info.name.isEmpty {
+                if let info = try? await irohService.fetchServerInfo(nodeId: nodeId), !info.name.isEmpty {
                     server.reportedName = info.name
                 }
 
@@ -280,6 +326,97 @@ struct ContentView: View {
         bindingTask = nil
         isBinding = false
         showPairingCancel = false
+    }
+
+    /// The "Running" section in the server list: live sessions across every
+    /// paired server, tap to resume, swipe to close.
+    private var runningSection: some View {
+        let sessions = sessionManager.running
+        return Section("Running") {
+            ForEach(sessions, id: \.key) { session in
+                runningRow(session)
+            }
+            .onDelete { offsets in
+                closeRunningSessions(at: offsets)
+            }
+        }
+    }
+
+    private func closeRunningSessions(at offsets: IndexSet) {
+        let sessions = sessionManager.running
+        for offset in offsets where offset < sessions.count {
+            sessionManager.close(sessions[offset].key)
+        }
+    }
+
+    /// A running app row: green dot + app name + server name; tap resumes the
+    /// warm session via the root-level route (same presenter the strip and the
+    /// detail view use); long-press closes it.
+    private func runningRow(_ session: WebAppSession) -> some View {
+        let key = session.key
+        let route = routeFor(key)
+        let appName = AppNameStore.name(nodeId: key.nodeId, app: key.app) ?? key.app
+        let server = servers.first { $0.nodeId == key.nodeId }
+        let serverName = server?.displayName ?? String(key.nodeId.prefix(12)) + "…"
+        return NavigationLink(value: route) {
+            HStack(spacing: 8) {
+                Circle()
+                    .fill(.green)
+                    .frame(width: 9, height: 9)
+                    .accessibilityLabel("Running")
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(appName).font(.headline)
+                    Text(serverName)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+        .contextMenu {
+            Button("Close App", role: .destructive) {
+                sessionManager.close(key)
+            }
+        }
+    }
+
+    /// Resolve the root-level push route for a session key; the port comes
+    /// from the server's catalog when it still has the app (display only).
+    private func routeFor(_ key: WebAppSessionKey) -> RunningAppRoute {
+        let server = servers.first { $0.nodeId == key.nodeId }
+        let port = server?.apps.first { $0.name == key.app }?.port
+        return RunningAppRoute(nodeId: key.nodeId, app: key.app, port: port ?? 0)
+    }
+
+    /// The presenter for a root-level running-app route. The web view itself
+    /// persists learned names in `AppNameStore`; the list rows read them on
+    /// rebuild, so the name callback here is a no-op.
+    private func appRouteView(_ route: RunningAppRoute) -> some View {
+        let launchPath = AppLaunchStore.path(nodeId: route.nodeId, app: route.app)
+        let app = AppInfo(name: route.app, path: "", port: route.port)
+        return AppWebView(
+            app: app,
+            nodeId: route.nodeId,
+            irohService: irohService,
+            monitor: connectionMonitor,
+            sessionManager: sessionManager,
+            launchPath: launchPath,
+            onNameLearned: { _ in
+                // no local state to update at the root level
+            },
+            onSwitchSession: { key in
+                openRunningSession(key)
+            }
+        )
+    }
+
+    /// Present a running (or newly opened) session: swap the whole stack to
+    /// the root-level app route. The previously presented session stays warm;
+    /// this only changes focus. Deterministic — no destination-registration
+    /// timing (the route's destination is registered at the root).
+    private func openRunningSession(_ key: WebAppSessionKey) {
+        sessionManager.activate(key)
+        path = NavigationPath()
+        path.append(routeFor(key))
     }
 
     private func serverRow(_ server: Server) -> some View {
@@ -321,8 +458,14 @@ struct ContentView: View {
     // MARK: - Persistence
 
     private func deleteServers(at offsets: IndexSet) {
+        let removed = offsets.map { servers[$0] }
         servers.remove(atOffsets: offsets)
         saveServers()
+        // Sessions of a deleted server would keep dialing a node the user no
+        // longer has a list entry for: close them too.
+        for server in removed {
+            sessionManager.closeRunningSessions(nodeId: server.nodeId)
+        }
     }
 
     private func loadServers() {

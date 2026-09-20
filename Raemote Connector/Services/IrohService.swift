@@ -124,12 +124,21 @@ final class IrohConnectionMonitor {
 actor IrohService {
     private let monitor: IrohConnectionMonitor
     private var endpoint: Endpoint?
-    private var httpConnection: Connection?
-    private var remoteNodeId: String?
-    /// The node the live `httpConnection` is actually connected to. Kept in sync
-    /// with `remoteNodeId` so a request for server B never rides A's connection.
-    private var connectedNodeId: String?
-    private var connectionWatcher: Task<Void, Never>?
+
+    /// One live serve connection **per paired server** (the resource-isolation
+    /// rule: a node's connection is its own). Web views of different servers
+    /// can stream simultaneously, so connections must not be swapped under
+    /// each other; `openStream(nodeId:)` binds a tunnel to its own server.
+    private var connections: [String: Connection] = [:]
+    /// The drop-watcher task per live connection.
+    private var watchers: [String: Task<Void, Never>] = [:]
+    /// The server the UI (detail/web view) is focused on: the monitor's state
+    /// and the default `httpRequest` target. Explicit `nodeId` parameters
+    /// always win over this.
+    private var activeNodeId: String?
+    /// In-flight connect tasks per node, so a burst of callers (web view +
+    /// revalidation) shares one dial instead of racing several.
+    private var connecting: [String: Task<Connection, Error>] = [:]
 
     private static let bindAlpn = Data("raemote/bind/0".utf8)
     private static let serveAlpn = Data("raemote/0".utf8)
@@ -194,8 +203,7 @@ actor IrohService {
     // MARK: - Bind
 
     func bind(serverNodeId: String, token: String) async throws {
-        dropConnectionIfDifferentNode(serverNodeId)
-        remoteNodeId = serverNodeId
+        await setFocus(serverNodeId)
         await setState(.connecting)
 
         do {
@@ -232,11 +240,10 @@ actor IrohService {
 
             // 2. Open a persistent connection over the serve ALPN.
             print("[IrohService] connecting over serve ALPN...")
-            let conn = try await connect(remoteId: remoteId, timeout: nil)
-            adopt(conn, nodeId: serverNodeId)
+            _ = try await connectAndAdopt(nodeId: serverNodeId, timeout: nil)
             await setState(.connected)
             // Tell the server how this device should be named (best effort).
-            try? await setDeviceName(DeviceNameStore.name)
+            try? await setDeviceName(DeviceNameStore.name, nodeId: serverNodeId)
             print("[IrohService] bound and ready")
         } catch is CancellationError {
             // The user aborted pairing; don't leave a misleading reason behind.
@@ -248,58 +255,43 @@ actor IrohService {
         }
     }
 
-    /// Ensures a live serve connection exists, reconnecting if needed.
+    /// Ensures a live serve connection to `nodeId`, reconnecting if needed.
     ///
     /// The server persists authorized nodes, so a client that previously bound
     /// can reconnect over `raemote/0` without the (short-lived) token.
-    func ensureConnection(nodeId: String) async throws {
-        dropConnectionIfDifferentNode(nodeId)
-        remoteNodeId = nodeId
-        if let conn = httpConnection, conn.closeReason() == nil {
-            await setState(.connected)
+    ///
+    /// Running web apps keep their own connection per node; `focus` marks the
+    /// node the UI is presenting (monitor state + default HTTP target).
+    func ensureConnection(nodeId: String, focus: Bool = true) async throws {
+        if focus { await setFocus(nodeId) }
+        if let conn = connections[nodeId], conn.closeReason() == nil {
+            if focus { await setState(.connected) }
             return
         }
-        await setState(.connecting)
-        do {
-            let remoteId = try EndpointId.fromString(s: nodeId)
-            let conn = try await connect(remoteId: remoteId, timeout: Self.connectTimeout)
-            adopt(conn, nodeId: nodeId)
-            await setState(.connected)
-        } catch {
-            await setState(.disconnected(error.localizedDescription))
-            throw error
+        _ = try await connectAndAdopt(nodeId: nodeId, timeout: Self.connectTimeout)
+        if focus { await setState(.connected) }
+    }
+
+    /// Marks which server the UI is presenting, so monitor state and the
+    /// parameterless `httpRequest` describe that server.
+    private func setFocus(_ nodeId: String) async {
+        if activeNodeId != nodeId {
+            activeNodeId = nodeId
+            // Any sampled path describes the *previous* focus; drop it so the
+            // UI never shows another server's transport info. The path-binding
+            // check (`IrohPathState.kind(for:)`) is the second guard.
+            let monitor = monitor
+            await MainActor.run { monitor.path = nil }
         }
-    }
-
-    /// Close the live connection when it belongs to a different server, so a
-    /// request for server B can't reuse server A's connection.
-    private func dropConnectionIfDifferentNode(_ nodeId: String) {
-        guard let conn = httpConnection,
-              !Self.canReuseConnection(connected: connectedNodeId, requested: nodeId)
-        else { return }
-        print("[IrohService] switching server: closing connection to \(connectedNodeId?.prefix(8) ?? "?")")
-        connectionWatcher?.cancel()
-        connectionWatcher = nil
-        try? conn.close(errorCode: 0, reason: Data("switching server".utf8))
-        httpConnection = nil
-        connectedNodeId = nil
-    }
-
-    /// Whether a live serve connection to `connected` may serve a request for
-    /// `requested`. Never reuse across different servers.
-    nonisolated static func canReuseConnection(connected: String?, requested: String?) -> Bool {
-        guard let connected, let requested else { return false }
-        return connected == requested
     }
 
     /// Actively verify the serve connection (used when the app returns to the
     /// foreground). Reconnects if the connection is gone or unusable.
     func validateConnection(nodeId: String) async {
-        remoteNodeId = nodeId
+        await setFocus(nodeId)
         // Drop a connection whose close reason is already known.
-        if let conn = httpConnection, conn.closeReason() != nil {
-            httpConnection = nil
-            connectedNodeId = nil
+        if let conn = connections[nodeId], conn.closeReason() != nil {
+            connections[nodeId] = nil
         }
         do {
             try await ensureConnection(nodeId: nodeId)
@@ -308,52 +300,79 @@ actor IrohService {
         }
         // Confirm it is actually usable; `send` self-heals if it is half-dead.
         do {
-            _ = try await httpRequest(method: "GET", path: "/_hub/catalog")
+            _ = try await httpRequest(method: "GET", path: "/_hub/catalog", nodeId: nodeId)
             await setState(.connected)
         } catch {
             await setState(.disconnected("connection unusable"))
         }
     }
 
+    /// Connect (or wait for an in-flight connect) over the serve ALPN and
+    /// register the connection for `nodeId`.
+    private func connectAndAdopt(nodeId: String, timeout: Double?) async throws -> Connection {
+        if let existing = connections[nodeId], existing.closeReason() == nil {
+            return existing
+        }
+        connections[nodeId] = nil
+        watchers[nodeId]?.cancel()
+        watchers[nodeId] = nil
+        if let inflight = connecting[nodeId], !inflight.isCancelled {
+            return try await inflight.value
+        }
+        let task = Task {
+            let ep = try await ensureEndpoint()
+            let remoteId = try EndpointId.fromString(s: nodeId)
+            let conn = try await Self.rawConnect(remoteId: remoteId, timeout: timeout, endpoint: ep)
+            return try self.finishAdopt(conn, nodeId: nodeId)
+        }
+        connecting[nodeId] = task
+        defer { connecting[nodeId] = nil }
+        return try await task.value
+    }
+
     /// Connect over the serve ALPN. `timeout` of `nil` waits indefinitely (used
     /// during pairing, where the UI offers an explicit cancel instead).
-    private func connect(remoteId: EndpointId, timeout: Double?) async throws -> Connection {
-        let ep = try await ensureEndpoint()
+    private nonisolated static func rawConnect(
+        remoteId: EndpointId,
+        timeout: Double?,
+        endpoint: Endpoint
+    ) async throws -> Connection {
         let remoteAddr = EndpointAddr(id: remoteId, relayUrl: nil, addresses: [])
         let conn: Connection
         if let timeout {
             conn = try await withTimeout(timeout) {
-                try await ep.connect(addr: remoteAddr, alpn: Self.serveAlpn)
+                try await endpoint.connect(addr: remoteAddr, alpn: serveAlpn)
             }
         } else {
             conn = try await withoutTimeout {
-                try await ep.connect(addr: remoteAddr, alpn: Self.serveAlpn)
+                try await endpoint.connect(addr: remoteAddr, alpn: serveAlpn)
             }
         }
-
-        // The server closes unauthorized connections immediately (code 401).
+        // Give the server's 401-rejection a beat to arrive before declaring
+        // the connection established.
         try? await Task.sleep(for: .milliseconds(300))
+        return conn
+    }
+
+    /// Register freshly created connection: per-node watcher keyed to it.
+    private func finishAdopt(_ conn: Connection, nodeId: String) throws -> Connection {
+        // The server closes unauthorized connections immediately (code 401).
         if let reason = conn.closeReason() {
             throw IrohError.bindDenied(
                 "server rejected the connection (node not authorized) — set up the server link again [\(reason)]"
             )
         }
-        return conn
-    }
-
-    /// Store `conn` as the active connection and watch for it dropping.
-    ///
-    /// `nodeId` is the server this connection was made to (rather than the
-    /// current `remoteNodeId`, which a concurrent call may have changed).
-    private func adopt(_ conn: Connection, nodeId: String) {
-        httpConnection = conn
-        connectedNodeId = nodeId
-        remoteNodeId = nodeId
-        connectionWatcher?.cancel()
-        connectionWatcher = Task { [weak self] in
+        connections[nodeId] = conn
+        watchers[nodeId]?.cancel()
+        // The watcher is bound to THIS connection, not the node key: if the
+        // connection drops after a reconnect already adopted a newer one, the
+        // stale watcher must not evict the live connection (identity compares
+        // inside `connectionDropped`).
+        watchers[nodeId] = Task { [weak self] in
             let reason = await conn.closed()
-            await self?.connectionDropped(conn, reason: reason)
+            await self?.connectionDropped(conn, nodeId: nodeId, reason: reason)
         }
+        return conn
     }
 
     /// Sample how the live connection reaches the server and publish it.
@@ -366,19 +385,25 @@ actor IrohService {
     /// `paths()` (a plain snapshot, no spawn) is the safe surface. A couple of
     /// seconds of lag is fine for a transport indicator.
     func refreshPathKind(nodeId: String) async {
-        guard let conn = httpConnection, connectedNodeId == nodeId, conn.closeReason() == nil else {
+        guard let conn = connections[nodeId], conn.closeReason() == nil else {
             return
         }
         let kind = IrohPathKind(paths: conn.paths().map(IrohPathFacts.init))
         await MainActor.run { monitor.path = IrohPathState(nodeId: nodeId, kind: kind) }
     }
 
-    private func connectionDropped(_ conn: Connection, reason: String) async {
-        guard httpConnection === conn else { return }
-        httpConnection = nil
-        connectedNodeId = nil
-        print("[IrohService] serve connection dropped: \(reason)")
-        await setState(.disconnected(reason))
+    private func connectionDropped(_ conn: Connection, nodeId: String, reason: String) async {
+        // Identity fence: only retire the map entry this watcher was created
+        // for. A dropped OLD connection after a reconnect must not tear down
+        // the live one.
+        guard connections[nodeId] === conn else { return }
+        connections[nodeId] = nil
+        watchers[nodeId]?.cancel()
+        watchers[nodeId] = nil
+        print("[IrohService] serve connection dropped: \(nodeId.prefix(8)) \(reason)")
+        if activeNodeId == nodeId {
+            await setState(.disconnected(reason))
+        }
     }
 
     private func setState(_ state: IrohConnectionState) async {
@@ -393,9 +418,13 @@ actor IrohService {
 
     // MARK: - HTTP over iroh
 
+    /// `nodeId` overrides the focused server; nil uses `activeNodeId`. Always
+    /// pass an explicit node when the request belongs to a specific server (a
+    /// background session must never ride the focused server's connection).
     func httpRequest(
         method: String,
         path: String,
+        nodeId: String? = nil,
         body: Data? = nil,
         contentType: String = "application/json"
     ) async throws -> (Int, Data) {
@@ -413,63 +442,52 @@ actor IrohService {
         let raw = try await send(
             request,
             sizeLimit: 1_000_000,
-            timeout: Self.requestTimeout
+            timeout: Self.requestTimeout,
+            nodeId: nodeId
         )
         return try Self.parseHttpResponse(raw)
     }
 
-    /// Send one request, self-healing once if the current connection is dead.
-    private func send(_ requestData: Data, sizeLimit: UInt32, timeout: Double) async throws -> Data {
-        // Never reuse a connection to a different server.
-        if let nodeId = remoteNodeId {
-            dropConnectionIfDifferentNode(nodeId)
+    /// Send one request, self-healing once if the connection is dead.
+    private func send(
+        _ requestData: Data,
+        sizeLimit: UInt32,
+        timeout: Double,
+        nodeId explicitNodeId: String?
+    ) async throws -> Data {
+        guard let nodeId = explicitNodeId ?? activeNodeId else {
+            throw IrohError.connectionFailed("Not bound")
         }
-        if let conn = httpConnection, conn.closeReason() == nil {
+        if let conn = connections[nodeId], conn.closeReason() == nil {
             do {
                 return try await withTimeout(timeout) {
                     try await Self.exchange(conn, requestData: requestData, sizeLimit: sizeLimit)
                 }
             } catch {
                 print("[IrohService] request failed, will reconnect: \(error)")
-                httpConnection = nil
-                connectedNodeId = nil
+                // Only retire the entry that actually failed: a concurrent
+                // reconnect may have adopted a different connection under the
+                // same key while this exchange was in flight.
+                if connections[nodeId] === conn {
+                    connections[nodeId] = nil
+                }
             }
         }
 
-        let conn = try await ensureServeConnection()
+        _ = try await connectAndAdopt(nodeId: nodeId, timeout: Self.connectTimeout)
+        guard let conn = connections[nodeId] else {
+            throw IrohError.connectionFailed("connection lost")
+        }
         do {
             return try await withTimeout(timeout) {
                 try await Self.exchange(conn, requestData: requestData, sizeLimit: sizeLimit)
             }
         } catch {
-            await setState(.disconnected(error.localizedDescription))
+            if nodeId == activeNodeId {
+                await setState(.disconnected(error.localizedDescription))
+            }
             throw error
         }
-    }
-
-    /// The live serve connection, connecting (or reconnecting) if needed.
-    private func ensureServeConnection() async throws -> Connection {
-        if let nodeId = remoteNodeId {
-            dropConnectionIfDifferentNode(nodeId)
-        }
-        if let conn = httpConnection, conn.closeReason() == nil {
-            return conn
-        }
-        guard let nodeId = remoteNodeId else {
-            throw IrohError.connectionFailed("Not bound")
-        }
-        await setState(.connecting)
-        let remoteId = try EndpointId.fromString(s: nodeId)
-        let conn: Connection
-        do {
-            conn = try await connect(remoteId: remoteId, timeout: Self.connectTimeout)
-        } catch {
-            await setState(.disconnected(error.localizedDescription))
-            throw error
-        }
-        adopt(conn, nodeId: nodeId)
-        await setState(.connected)
-        return conn
     }
 
     /// An open bidirectional serve stream, used by the streaming proxy tunnel.
@@ -478,10 +496,12 @@ actor IrohService {
         let recv: RecvStream
     }
 
-    /// Open a bidirectional stream on the serve connection (for the streaming
-    /// proxy). Unlike `relay`, the caller owns both halves and pumps bytes.
-    func openStream() async throws -> RawStream {
-        let conn = try await ensureServeConnection()
+    /// Open a bidirectional stream on `nodeId`'s serve connection (for the
+    /// streaming proxy). Unlike `relay`, the caller owns both halves and pumps
+    /// bytes. The node is explicit so a tunnel can never ride another server's
+    /// connection.
+    func openStream(nodeId: String) async throws -> RawStream {
+        let conn = try await connectAndAdopt(nodeId: nodeId, timeout: Self.connectTimeout)
         let bi = try await conn.openBi()
         return RawStream(send: bi.send(), recv: bi.recv())
     }
@@ -504,8 +524,8 @@ actor IrohService {
         let apps: [AppInfo]
     }
 
-    func fetchCatalog() async throws -> [AppInfo] {
-        let (status, body) = try await httpRequest(method: "GET", path: "/_hub/catalog")
+    func fetchCatalog(nodeId: String? = nil) async throws -> [AppInfo] {
+        let (status, body) = try await httpRequest(method: "GET", path: "/_hub/catalog", nodeId: nodeId)
         guard status == 200 else {
             throw IrohError.http(status: status, body: body)
         }
@@ -513,8 +533,8 @@ actor IrohService {
     }
 
     /// Ask the server to rescan for local apps, then return the fresh catalog.
-    func discoverCatalog() async throws -> [AppInfo] {
-        let (status, body) = try await httpRequest(method: "POST", path: "/_hub/discover")
+    func discoverCatalog(nodeId: String? = nil) async throws -> [AppInfo] {
+        let (status, body) = try await httpRequest(method: "POST", path: "/_hub/discover", nodeId: nodeId)
         guard status == 200 else {
             throw IrohError.http(status: status, body: body)
         }
@@ -538,8 +558,8 @@ actor IrohService {
     }
 
     /// Fetch the server's display name and version.
-    func fetchServerInfo() async throws -> ServerInfo {
-        let (status, body) = try await httpRequest(method: "GET", path: "/_hub/info")
+    func fetchServerInfo(nodeId: String? = nil) async throws -> ServerInfo {
+        let (status, body) = try await httpRequest(method: "GET", path: "/_hub/info", nodeId: nodeId)
         guard status == 200 else {
             throw IrohError.http(status: status, body: body)
         }
@@ -562,8 +582,8 @@ actor IrohService {
     }
 
     /// Mint a one-time invitation so another device can pair with this server.
-    func createInvitation() async throws -> Invitation {
-        let (status, body) = try await httpRequest(method: "POST", path: "/_hub/invite")
+    func createInvitation(nodeId: String? = nil) async throws -> Invitation {
+        let (status, body) = try await httpRequest(method: "POST", path: "/_hub/invite", nodeId: nodeId)
         guard status == 200 else {
             throw IrohError.http(status: status, body: body)
         }
@@ -572,13 +592,14 @@ actor IrohService {
 
     // MARK: - Device name
 
-    /// Ask the connected server to store this device's display name.
-    func setDeviceName(_ name: String) async throws {
+    /// Ask the server to store this device's display name.
+    func setDeviceName(_ name: String, nodeId: String? = nil) async throws {
         struct Body: Encodable { let name: String }
         let body = try JSONEncoder().encode(Body(name: name))
         let (status, responseBody) = try await httpRequest(
             method: "PUT",
             path: "/_hub/device",
+            nodeId: nodeId,
             body: body
         )
         guard status == 200 else {
@@ -586,12 +607,13 @@ actor IrohService {
         }
     }
 
-    /// Best-effort: set this device's name on each bound server.
+    /// Best-effort: set this device's name on each bound server. Background,
+    /// non-focused: it must not steal the UI's focused connection state.
     func syncDeviceName(to nodeIds: [String], name: String) async {
         for nodeId in nodeIds {
             do {
-                try await ensureConnection(nodeId: nodeId)
-                try await setDeviceName(name)
+                try await ensureConnection(nodeId: nodeId, focus: false)
+                try await setDeviceName(name, nodeId: nodeId)
             } catch {
                 print("[IrohService] could not set device name on \(nodeId.prefix(8)): \(error)")
             }
@@ -621,13 +643,16 @@ actor IrohService {
     // MARK: - Cleanup
 
     func disconnect() async {
-        connectionWatcher?.cancel()
-        connectionWatcher = nil
-        if let conn = httpConnection {
-            try? conn.close(errorCode: 0, reason: Data("bye".utf8))
-            httpConnection = nil
+        for watcher in watchers.values {
+            watcher.cancel()
         }
-        connectedNodeId = nil
+        for conn in connections.values {
+            try? conn.close(errorCode: 0, reason: Data("bye".utf8))
+        }
+        connections.removeAll()
+        watchers.removeAll()
+        connecting.removeAll()
+        activeNodeId = nil
         endpoint = nil
         await setState(.unknown)
     }
@@ -636,19 +661,20 @@ actor IrohService {
 // MARK: - Timeout helper
 
 /// Resumes a continuation at most once, so a timeout and a late-returning
-/// operation can't both resume it.
-private final class ResumeOnce<T: Sendable>: @unchecked Sendable {
+/// operation can't both resume it. NSLock-guarded; callable from any executor
+/// (the timeout task races the operation task), hence `nonisolated`.
+private nonisolated final class ResumeOnce<T: Sendable>: @unchecked Sendable {
     private let lock = NSLock()
     private var continuation: CheckedContinuation<T, Error>?
     private var finished = false
 
-    func store(_ continuation: CheckedContinuation<T, Error>) {
+    nonisolated func store(_ continuation: CheckedContinuation<T, Error>) {
         lock.lock()
         defer { lock.unlock() }
         self.continuation = continuation
     }
 
-    func resume(_ result: Result<T, Error>) {
+    nonisolated func resume(_ result: Result<T, Error>) {
         lock.lock()
         defer { lock.unlock() }
         guard !finished, let continuation else { return }

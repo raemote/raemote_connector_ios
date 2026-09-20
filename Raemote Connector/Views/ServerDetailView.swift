@@ -4,9 +4,13 @@ struct ServerDetailView: View {
     let server: Server
     let irohService: IrohService
     let monitor: IrohConnectionMonitor
+    let sessionManager: WebAppSessionManager
     let onAppsUpdated: ([AppInfo]) -> Void
     let onAliasChange: (String) -> Void
     let onReportedName: (String) -> Void
+    /// The user tapped another running app in the web-view strip; the router
+    /// (the server list) decides how to present it. Current stays warm.
+    let onSwitchSession: (WebAppSessionKey) -> Void
 
     @State private var apps: [AppInfo]
     /// Display names learned from each app's live page title, keyed by the
@@ -43,16 +47,20 @@ struct ServerDetailView: View {
         server: Server,
         irohService: IrohService,
         monitor: IrohConnectionMonitor,
+        sessionManager: WebAppSessionManager,
         onAppsUpdated: @escaping ([AppInfo]) -> Void,
         onAliasChange: @escaping (String) -> Void,
-        onReportedName: @escaping (String) -> Void
+        onReportedName: @escaping (String) -> Void,
+        onSwitchSession: @escaping (WebAppSessionKey) -> Void
     ) {
         self.server = server
         self.irohService = irohService
         self.monitor = monitor
+        self.sessionManager = sessionManager
         self.onAppsUpdated = onAppsUpdated
         self.onAliasChange = onAliasChange
         self.onReportedName = onReportedName
+        self.onSwitchSession = onSwitchSession
         _apps = State(initialValue: server.apps)
         _appNames = State(initialValue: AppNameStore.names(nodeId: server.nodeId))
         _launchPaths = State(initialValue: AppLaunchStore.paths(nodeId: server.nodeId))
@@ -92,10 +100,12 @@ struct ServerDetailView: View {
                 nodeId: server.nodeId,
                 irohService: irohService,
                 monitor: monitor,
+                sessionManager: sessionManager,
                 launchPath: launchPaths[app.name],
                 onNameLearned: { name in
                     appNames[app.name] = name
-                }
+                },
+                onSwitchSession: onSwitchSession
             )
         }
         .toolbar {
@@ -179,8 +189,7 @@ struct ServerDetailView: View {
         .task(id: server.nodeId) {
             // Establish/probe the serve connection so the indicator reflects
             // reality as soon as this screen appears.
-            await irohService.validateConnection(nodeId: server.nodeId)
-            await loadServerInfo()
+            await revalidateOnAppear()
         }
         .onChange(of: monitor.state) { _, newState in
             // (Re)read the name once the connection is up, in case the first
@@ -193,17 +202,19 @@ struct ServerDetailView: View {
             // Lock/unlock or background/foreground: the serve connection may
             // have been torn down while suspended, so revalidate on return.
             guard phase == .active else { return }
-            Task {
-                await irohService.validateConnection(nodeId: server.nodeId)
-                await loadServerInfo()
-            }
+            Task { await revalidateOnAppear() }
         }
+    }
+
+    private func revalidateOnAppear() async {
+        await irohService.validateConnection(nodeId: server.nodeId)
+        await loadServerInfo()
     }
 
     /// Read the name the server reports about itself.
     private func loadServerInfo() async {
         guard case .connected = monitor.state else { return }
-        guard let info = try? await irohService.fetchServerInfo(), !info.name.isEmpty else { return }
+        guard let info = try? await irohService.fetchServerInfo(nodeId: server.nodeId), !info.name.isEmpty else { return }
         guard info.name != reportedName else { return }
         reportedName = info.name
         onReportedName(info.name)
@@ -225,7 +236,7 @@ struct ServerDetailView: View {
             return
         }
         do {
-            let invite = try await irohService.createInvitation()
+            let invite = try await irohService.createInvitation(nodeId: server.nodeId)
             invitation = InvitationPresentation(
                 uri: invite.uri,
                 expiresAt: Date(timeIntervalSince1970: TimeInterval(invite.expiresAtUnix))
@@ -248,7 +259,7 @@ struct ServerDetailView: View {
         await loadServerInfo()
 
         do {
-            let updated = try await irohService.discoverCatalog()
+            let updated = try await irohService.discoverCatalog(nodeId: server.nodeId)
             apps = updated
             onAppsUpdated(updated)
         } catch {
@@ -326,6 +337,14 @@ struct ServerDetailView: View {
     private func appRow(_ app: AppInfo) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 6) {
+                // Green dot = the app is running in the background; tapping
+                // resumes it warm instead of reconnecting/reopening.
+                if sessionManager.isRunning(nodeId: server.nodeId, app: app.name) {
+                    Circle()
+                        .fill(.green)
+                        .frame(width: 8, height: 8)
+                        .accessibilityLabel("Running")
+                }
                 Text(appNames[app.name] ?? app.name)
                     .font(.headline)
                 if launchPaths[app.name] != nil {
@@ -349,6 +368,11 @@ struct ServerDetailView: View {
                 Button("Clear Launch URL", role: .destructive) {
                     AppLaunchStore.remember("", nodeId: server.nodeId, app: app.name)
                     launchPaths[app.name] = nil
+                }
+            }
+            if sessionManager.isRunning(nodeId: server.nodeId, app: app.name) {
+                Button("Close Running App", role: .destructive) {
+                    sessionManager.close(nodeId: server.nodeId, app: app.name)
                 }
             }
         }

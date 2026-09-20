@@ -22,7 +22,7 @@ struct RewrittenHead: Equatable {
 
 /// Pure HTTP helpers for the tunnel. Kept UIKit/Network-free so they can be
 /// unit-tested.
-enum ProxyHTTP {
+nonisolated enum ProxyHTTP {
     /// Index just past the head's terminating CRLF CRLF, if present.
     static func headEnd(in data: Data) -> Int? {
         data.range(of: Data("\r\n\r\n".utf8))?.upperBound
@@ -33,7 +33,7 @@ enum ProxyHTTP {
     /// else is forced to `Connection: close` so the response is EOF-delimited.
     static func rewriteHead(_ head: Data, appName: String) -> RewrittenHead? {
         guard let text = String(data: head, encoding: .utf8) else { return nil }
-        var lines = text.components(separatedBy: "\r\n")
+        let lines = text.components(separatedBy: "\r\n")
         guard let requestLine = lines.first, !requestLine.isEmpty else { return nil }
         let parts = requestLine.split(separator: " ")
         guard parts.count >= 3 else { return nil }
@@ -169,16 +169,20 @@ nonisolated final class ProxyTunnel: @unchecked Sendable {
     private let connection: NWConnection
     private let appName: String
     private let service: IrohService
+    /// Which server this tunnel relays to: streams are bound per server so a
+    /// background app from server B can never ride server A's connection.
+    private let nodeId: String
 
     /// Largest request head we'll buffer before giving up.
     private static let maxHeadBytes = 64 * 1024
     /// Largest error body we'll buffer to swap for an HTML page.
     private static let maxErrorBytes = 64 * 1024
 
-    init(connection: NWConnection, appName: String, service: IrohService) {
+    init(connection: NWConnection, appName: String, service: IrohService, nodeId: String) {
         self.connection = connection
         self.appName = appName
         self.service = service
+        self.nodeId = nodeId
     }
 
     func start() async {
@@ -191,7 +195,7 @@ nonisolated final class ProxyTunnel: @unchecked Sendable {
 
         let stream: IrohService.RawStream
         do {
-            stream = try await service.openStream()
+            stream = try await service.openStream(nodeId: nodeId)
         } catch {
             await sendError(
                 status: 502,

@@ -17,10 +17,10 @@ enum KeychainSecretStore {
     /// with its own bundle id gets its own Keychain entry. For an existing
     /// install the value is unchanged, which matters: moving it would make the
     /// app look like a new device and require pairing again.
-    static let defaultService = Bundle.main.bundleIdentifier ?? "raemote"
-    static let defaultAccount = "iroh-secret-key"
+    nonisolated static let defaultService = Bundle.main.bundleIdentifier ?? "raemote"
+    nonisolated static let defaultAccount = "iroh-secret-key"
 
-    private static func baseQuery(service: String, account: String) -> [String: Any] {
+    private nonisolated static func baseQuery(service: String, account: String) -> [String: Any] {
         [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -28,8 +28,11 @@ enum KeychainSecretStore {
         ]
     }
 
+    // `nonisolated`: `SecItemCopyMatching`/`SecItemUpdate`/`SecItemDelete` are
+    // thread-safe, and the actor runs key loading on its own executor.
+
     /// Read the stored key, or `nil` if none is present.
-    static func load(
+    nonisolated static func load(
         service: String = defaultService,
         account: String = defaultAccount
     ) -> Data? {
@@ -45,7 +48,7 @@ enum KeychainSecretStore {
 
     /// Store (or replace) the key. Returns `false` on failure.
     @discardableResult
-    static func save(
+    nonisolated static func save(
         _ data: Data,
         service: String = defaultService,
         account: String = defaultAccount
@@ -67,7 +70,7 @@ enum KeychainSecretStore {
 
     /// Remove the stored key. Returns `false` on failure.
     @discardableResult
-    static func delete(
+    nonisolated static func delete(
         service: String = defaultService,
         account: String = defaultAccount
     ) -> Bool {

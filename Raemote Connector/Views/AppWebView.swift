@@ -62,16 +62,22 @@ struct AppWebView: View {
     let nodeId: String
     let irohService: IrohService
     let monitor: IrohConnectionMonitor
+    /// The running-apps registry: this view presents one session; leaving does
+    /// not close it (apps run in the background until the user closes them).
+    let sessionManager: WebAppSessionManager
     /// An optional path/query to open the app with (`AppLaunchStore`), for apps
     /// whose entry URL carries a one-time token.
     var launchPath: String?
     /// Called when the app shows a page title worth remembering.
     var onNameLearned: (String) -> Void = { _ in }
+    /// The user tapped another running app in the strip; the router decides
+    /// how to present it (the current session stays warm).
+    var onSwitchSession: (WebAppSessionKey) -> Void = { _ in }
 
-    @State private var proxy: LocalProxyServer?
-    @State private var proxyURL: URL?
-    @State private var state = WebViewState()
-    @State private var startingProxy = false
+    /// This app's running session (created on first appearance).
+    private var sessionKey: WebAppSessionKey {
+        WebAppSessionKey(nodeId: nodeId, app: app.name)
+    }
     /// The name learned from the live page title, if the app has shown one.
     @State private var learnedName: String?
 
@@ -94,7 +100,8 @@ struct AppWebView: View {
     private var displayName: String { learnedName ?? app.name }
 
     /// What the page is busy doing, if anything.
-    private var busyText: String? {
+    private func busyText(session: WebAppSession) -> String? {
+        let state = session.state
         if let name = state.downloadingFileName { return "Downloading \(name)…" }
         if state.isPreparingShare { return "Preparing to share…" }
         return nil
@@ -121,21 +128,41 @@ struct AppWebView: View {
     }
 
     var body: some View {
-        @Bindable var state = state
+        // The session owns proxy + web view; this view only presents it. A
+        // background session's page keeps running while the user is elsewhere.
+        @ViewBuilder
+        func presented() -> some View {
+            if let session = sessionManager.session(for: sessionKey) {
+                present(session)
+            } else {
+                // Blink before open() below creates the session.
+                ProgressView("Starting \(app.name)...")
+            }
+        }
 
-        // `GeometryReader` keeps the container full-screen even while the page
-        // is still loading (when the only child is a small ProgressView), so the
-        // controls stay pinned to the bottom instead of drifting to the center.
-        GeometryReader { geometry in
+        return presented()
+            .task {
+                // Open (or resume) this app's session — idempotent, and the
+                // LRU `touch()` on reappearances keeps ordering right.
+                _ = sessionManager.open(nodeId: nodeId, app: app.name)
+                sessionManager.activate(sessionKey)
+            }
+    }
+
+    /// The presented session: full-screen page + floating control.
+    private func present(_ session: WebAppSession) -> some View {
+        @Bindable var session = session
+        let state = session.state
+        @Bindable var webState = session.state
+        return GeometryReader { geometry in
             ZStack {
-                if let proxyURL {
+                if let proxyURL = session.proxyURL {
                     // Respect the safe area, like Safari: the page is laid out
                     // clear of the status bar/notch and the home indicator
                     // instead of running underneath them.
                     WebViewRepresentable(
                         url: proxyURL,
-                        state: state,
-                        nodeId: nodeId,
+                        session: session,
                         appName: app.name,
                         onNameLearned: { name in
                             learnedName = name
@@ -161,19 +188,19 @@ struct AppWebView: View {
                     connectionGate
                 }
 
-                if proxyURL != nil, !state.isFullscreen {
-                    floatingControl(in: geometry.size)
+                if session.proxyURL != nil, !state.isFullscreen {
+                    floatingControl(in: geometry.size, session: session)
                 }
 
                 // Any operation that takes time announces itself here: the
                 // floating card collapses when it starts one, so its own
                 // spinner would be hidden.
-                if let busyText {
-                    busyBanner(busyText)
+                if let busy = busyText(session: session) {
+                    busyBanner(busy)
                         .transition(.move(edge: .top).combined(with: .opacity))
                 }
             }
-            .animation(.snappy(duration: 0.25), value: busyText)
+            .animation(.snappy(duration: 0.25), value: busyText(session: session))
             .frame(width: geometry.size.width, height: geometry.size.height)
         }
         // Paint the safe-area bands (notch, home indicator) the same colour the
@@ -185,34 +212,35 @@ struct AppWebView: View {
         .navigationBarBackButtonHidden(true)
         .toolbar(.hidden, for: .navigationBar)
         .task {
+            // Mark this session active (strip, status, LRU ordering), even on
+            // re-appearance — the proxy may already be running.
+            sessionManager.activate(sessionKey)
             learnedName = AppNameStore.name(nodeId: nodeId, app: app.name)
-            await connectThenStart()
-            // Keep the direct/relayed indicator current while the page is open.
-            await pollConnectionKind()
+            await connectThenStart(session: session)
+            // Keep the direct/relayed indicator current while presented.
+            await pollConnectionKind(session: session)
         }
         .onChange(of: scenePhase) { _, phase in
             guard phase == .active else { return }
-            Task { await revalidate() }
+            Task { await revalidate(session: session) }
         }
         .onChange(of: monitor.state) { _, newState in
-            if case .connected = newState, proxyURL == nil {
-                Task { await startProxyIfConnected() }
+            if case .connected = newState, session.proxyURL == nil {
+                Task { await startProxyIfConnected(session: session) }
             }
         }
-        .onChange(of: state.isExpanded) { _, expanded in
+        .onChange(of: session.state.isExpanded) { _, expanded in
             withAnimation(.snappy(duration: 0.3)) { expansion = expanded ? 1 : 0 }
         }
-        .onDisappear {
-            proxy?.stop()
-            proxy = nil
-        }
-        .sheet(item: $state.shareRequest) { request in
+        // No teardown on disappear: background sessions keep their proxy and
+        // page. Stopping an app is only possible from the Running list.
+        .sheet(item: $webState.shareRequest) { request in
             ActivityView(items: request.items)
         }
-        .alert("Couldn't Share", isPresented: .constant(state.shareError != nil)) {
-            Button("OK") { state.shareError = nil }
+        .alert("Couldn't Share", isPresented: .constant(webState.shareError != nil)) {
+            Button("OK") { webState.shareError = nil }
         } message: {
-            if let shareError = state.shareError {
+            if let shareError = webState.shareError {
                 Text(shareError)
             }
         }
@@ -239,56 +267,55 @@ struct AppWebView: View {
     }
 
     /// Wait for a live connection, then bring up the loopback proxy. Retries
-    /// until connected (or the view goes away).
-    private func connectThenStart() async {
+    /// until connected (or the view goes away). Re-presenting a running app
+    /// skips the wait: the proxy is already up.
+    private func connectThenStart(session: WebAppSession) async {
+        if session.proxyURL != nil {
+            await irohService.validateConnection(nodeId: nodeId)
+            return
+        }
         while !Task.isCancelled {
             await irohService.validateConnection(nodeId: nodeId)
             if case .connected = monitor.state { break }
             try? await Task.sleep(for: .seconds(2))
         }
         guard !Task.isCancelled else { return }
-        await startProxyIfConnected()
+        await startProxyIfConnected(session: session)
     }
 
     /// Sample the transport (direct vs relayed) until the view goes away. A
     /// sample rather than a subscription: the FFI's `watchPaths` needs a tokio
     /// runtime context a Swift caller can't provide (see `refreshPathKind`).
-    private func pollConnectionKind() async {
+    private func pollConnectionKind(session: WebAppSession) async {
         while !Task.isCancelled {
-            await irohService.refreshPathKind(nodeId: nodeId)
+            // Only the presented session drives the transport indicator;
+            // background sessions don't need live sampling.
+            if sessionManager.isActive(sessionKey) {
+                await irohService.refreshPathKind(nodeId: nodeId)
+            }
             try? await Task.sleep(for: .seconds(2))
         }
     }
 
-    private func startProxyIfConnected() async {
-        guard proxy == nil, !startingProxy else { return }
+    private func startProxyIfConnected(session: WebAppSession) async {
+        guard session.proxyURL == nil else { return }
         guard case .connected = monitor.state else { return }
-        startingProxy = true
-        defer { startingProxy = false }
         do {
-            let server = LocalProxyServer(
-                appName: app.name,
-                service: irohService,
-                preferredPort: ProxyPortStore.preferredPort(nodeId: nodeId, app: app.name)
-            )
-            let port = try await server.start()
-            // Remember the port so the origin stays stable next time.
-            ProxyPortStore.remember(port, nodeId: nodeId, app: app.name)
-            proxy = server
-            // WKWebView now talks to the in-app loopback proxy, which relays
-            // every request over iroh to the raemote server. A stored launch
-            // path (e.g. `/?token=…`) is included so token-gated apps start.
-            proxyURL = URL(string: "http://127.0.0.1:\(port)\(launchPath ?? "/")")
+            // A stored launch path (e.g. `/?token=…`) applies on first start;
+            // later activations resume where the page already is.
+            _ = try await sessionManager.ensureProxy(for: session, launchPath: launchPath)
         } catch {
-            state.errorMessage = error.localizedDescription
+            session.state.errorMessage = error.localizedDescription
         }
     }
 
     /// On foreground, make sure the serve connection is alive and retry a page
     /// that failed while the app was suspended.
-    private func revalidate() async {
+    private func revalidate(session: WebAppSession) async {
+        guard sessionManager.isActive(sessionKey) else { return }
         await irohService.validateConnection(nodeId: nodeId)
-        if state.errorMessage != nil, let url = proxyURL {
+        let state = session.state
+        if state.errorMessage != nil, let url = session.proxyURL {
             state.errorMessage = nil
             state.isLoading = true
             state.webView?.load(URLRequest(url: url))
@@ -300,8 +327,20 @@ struct AppWebView: View {
     private var controlCardWidth: CGFloat { 268 }
     private var controlHeaderHeight: CGFloat { 50 }
     private var controlButtonsHeight: CGFloat { 54 }
-    /// Header + the 1pt `Divider` + the button row.
-    private var controlCardHeight: CGFloat { controlHeaderHeight + 1 + controlButtonsHeight }
+    private var controlStripHeight: CGFloat { 45 }
+    /// Header + the 1pt `Divider` + (strip when present) + the button row.
+    private func controlCardHeight(stripVisible: Bool) -> CGFloat {
+        var height = controlHeaderHeight + 1 + controlButtonsHeight
+        if stripVisible {
+            height += 1 + controlStripHeight
+        }
+        return height
+    }
+
+    /// One or more *other* sessions are running: the strip shows in the card.
+    private var runningAppsStripVisible: Bool {
+        sessionManager.running.contains { $0.key != sessionKey }
+    }
 
     /// How *this* server's live connection reaches us, or `nil` when unknown or
     /// when the recorded path belongs to a different server.
@@ -328,7 +367,7 @@ struct AppWebView: View {
     /// The circle — or, when expanded, the card — that floats over the page.
     /// The circle can be dragged to any edge; it snaps there and remembers it.
     @ViewBuilder
-    private func floatingControl(in size: CGSize) -> some View {
+    private func floatingControl(in size: CGSize, session: WebAppSession) -> some View {
         let base = placement.center(in: size, safeInsets: EdgeInsets(), diameter: controlDiameter)
         let dragCenter = CGPoint(
             x: base.x + dragTranslation.width,
@@ -336,20 +375,20 @@ struct AppWebView: View {
         )
 
         ZStack {
-            controlCircle
+            controlCircle(session: session)
                 .position(dragCenter)
-                .gesture(dragGesture(in: size))
+                .gesture(dragGesture(in: size, session: session))
 
             // Kept in the hierarchy while collapsed (at zero size/opacity) so the
             // card can morph out of, and back into, the circle.
-            controlCard(circleCenter: base, in: size, progress: expansion)
-                .allowsHitTesting(state.isExpanded)
-                .accessibilityHidden(!state.isExpanded)
+            controlCard(circleCenter: base, in: size, progress: expansion, session: session)
+                .allowsHitTesting(session.state.isExpanded)
+                .accessibilityHidden(!session.state.isExpanded)
         }
     }
 
-    private var controlCircle: some View {
-        Image(systemName: state.isExpanded ? "chevron.down" : "ellipsis")
+    private func controlCircle(session: WebAppSession) -> some View {
+        Image(systemName: session.state.isExpanded ? "chevron.down" : "ellipsis")
             .font(.system(size: 18, weight: .bold))
             .frame(width: controlDiameter, height: controlDiameter)
             .contentShape(Circle())
@@ -363,17 +402,17 @@ struct AppWebView: View {
                         .frame(width: controlDiameter - 9, height: controlDiameter - 9)
                 }
             }
-            .accessibilityLabel(controlAccessibilityLabel)
+            .accessibilityLabel(controlAccessibilityLabel(session: session))
             .accessibilityAddTraits(.isButton)
     }
 
-    private var controlAccessibilityLabel: String {
-        let action = state.isExpanded ? "Hide controls" : "Show controls"
+    private func controlAccessibilityLabel(session: WebAppSession) -> String {
+        let action = session.state.isExpanded ? "Hide controls" : "Show controls"
         return "\(action). \(connectionLabel.text)"
     }
 
     /// Tap toggles the card; a drag snaps the circle to the nearest edge.
-    private func dragGesture(in size: CGSize) -> some Gesture {
+    private func dragGesture(in size: CGSize, session: WebAppSession) -> some Gesture {
         DragGesture(minimumDistance: 0)
             .onChanged { value in
                 dragTranslation = value.translation
@@ -385,7 +424,7 @@ struct AppWebView: View {
                     // circle doesn't jump back to its resting spot first.
                     withAnimation(.snappy(duration: 0.2)) {
                         dragTranslation = .zero
-                        state.isExpanded.toggle()
+                        session.state.isExpanded.toggle()
                     }
                     return
                 }
@@ -407,7 +446,7 @@ struct AppWebView: View {
                 withAnimation(.snappy(duration: 0.25)) {
                     dragTranslation = .zero
                     placement = snapped
-                    state.isExpanded = false
+                    session.state.isExpanded = false
                 }
                 FloatingControlStore.save(snapped)
             }
@@ -415,18 +454,20 @@ struct AppWebView: View {
 
     /// The card, interpolated between collapsed (circle-sized, transparent, and
     /// sitting exactly on the circle) and expanded (its resting place).
-    private func controlCard(circleCenter: CGPoint, in size: CGSize, progress: CGFloat) -> some View {
+    private func controlCard(circleCenter: CGPoint, in size: CGSize, progress: CGFloat, session: WebAppSession) -> some View {
         let restingCenter = cardCenter(circleCenter: circleCenter, in: size)
         let center = CGPoint(
             x: circleCenter.x + (restingCenter.x - circleCenter.x) * progress,
             y: circleCenter.y + (restingCenter.y - circleCenter.y) * progress
         )
         // Start at the circle's own size, so the two read as one shape morphing.
+        let cardHeight = controlCardHeight(stripVisible: runningAppsStripVisible)
         let collapsedX = controlDiameter / controlCardWidth
-        let collapsedY = controlDiameter / controlCardHeight
+        let collapsedY = controlDiameter / cardHeight
         let scaleX = collapsedX + (1 - collapsedX) * progress
         let scaleY = collapsedY + (1 - collapsedY) * progress
 
+        let state = session.state
         return VStack(spacing: 0) {
             VStack(spacing: 2) {
                 Text(connectionLabel.text)
@@ -450,6 +491,11 @@ struct AppWebView: View {
 
             Divider()
 
+            if runningAppsStripVisible {
+                runningAppsStrip
+                Divider()
+            }
+
             HStack(spacing: 12) {
                 controlButton(
                     systemName: "chevron.backward",
@@ -457,7 +503,7 @@ struct AppWebView: View {
                     enabled: state.canGoBack
                 ) {
                     state.goBack()
-                    collapse()
+                    collapse(session: session)
                 }
 
                 controlButton(
@@ -466,16 +512,19 @@ struct AppWebView: View {
                     enabled: state.canGoForward
                 ) {
                     state.goForward()
-                    collapse()
+                    collapse(session: session)
                 }
 
-                shareButton
+                shareButton(session: session)
 
                 Rectangle()
                     .fill(.secondary.opacity(0.25))
                     .frame(width: 1, height: 20)
 
-                controlButton(systemName: "xmark", label: "Close app", enabled: true) {
+                controlButton(systemName: "xmark", label: "Exit app", enabled: true) {
+                    // Exit only: the session keeps running in the background
+                    // (it appears in the Running list). Stopping an app is a
+                    // deliberate list action (swipe / close menu there).
                     dismiss()
                 }
             }
@@ -490,12 +539,52 @@ struct AppWebView: View {
         .position(center)
     }
 
+    /// The running-apps strip: tap a row to swap the presented session in
+    /// place (both stay warm). Hidden with fewer than two running apps.
+    private var runningAppsStrip: some View {
+        let others = sessionManager.running.filter { $0.key != sessionKey }
+        return Group {
+            if others.count >= 1 {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 10) {
+                        ForEach(others, id: \.key) { other in
+                            Button {
+                                // Tell the router to present this session's
+                                // app; the current one stays warm.
+                                onSwitchSession(other.key)
+                            } label: {
+                                VStack(spacing: 3) {
+                                    Image(systemName: "globe")
+                                        .font(.system(size: 15, weight: .semibold))
+                                        .frame(width: 30, height: 30)
+                                        .glassSurface(Circle())
+                                    Text(other.key.app)
+                                        .font(.caption2)
+                                        .lineLimit(1)
+                                        .truncationMode(.tail)
+                                }
+                                .padding(.horizontal, 4)
+                            }
+                            .buttonStyle(.plain)
+                            .frame(width: 52)
+                            .accessibilityLabel("Switch to \(other.key.app)")
+                        }
+                    }
+                    .padding(.horizontal, 10)
+                    .frame(maxWidth: .infinity)
+                }
+                .frame(height: 44)
+            }
+        }
+    }
+
+
     /// Where the card sits relative to the circle (toward the screen interior).
     private func cardCenter(circleCenter: CGPoint, in size: CGSize) -> CGPoint {
         let gap: CGFloat = 10
         let radius = controlDiameter / 2
         let halfWidth = controlCardWidth / 2
-        let halfHeight = controlCardHeight / 2
+        let halfHeight = controlCardHeight(stripVisible: runningAppsStripVisible) / 2
 
         var x = circleCenter.x
         var y = circleCenter.y
@@ -512,8 +601,8 @@ struct AppWebView: View {
         return CGPoint(x: x, y: y)
     }
 
-    private func collapse() {
-        withAnimation(.snappy(duration: 0.2)) { state.isExpanded = false }
+    private func collapse(session: WebAppSession) {
+        withAnimation(.snappy(duration: 0.2)) { session.state.isExpanded = false }
     }
 
     /// A circular icon button used inside the card.
@@ -535,13 +624,13 @@ struct AppWebView: View {
         .accessibilityLabel(label)
     }
 
-    private var shareButton: some View {
+    private func shareButton(session: WebAppSession) -> some View {
         Button {
-            collapse()
-            Task { await prepareShare() }
+            collapse(session: session)
+            Task { await prepareShare(session: session) }
         } label: {
             ZStack {
-                if state.isPreparingShare {
+                if session.state.isPreparingShare {
                     ProgressView()
                 } else {
                     Image(systemName: "square.and.arrow.up")
@@ -552,7 +641,7 @@ struct AppWebView: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .disabled(state.webView == nil || state.isPreparingShare)
+        .disabled(session.state.webView == nil || session.state.isPreparingShare)
         .accessibilityLabel("Share")
     }
 
@@ -560,8 +649,9 @@ struct AppWebView: View {
 
     /// Build the item(s) for the system share sheet. Web pages share an adaptive
     /// item (Raemote link + PDF); every other content type shares the real file.
-    private func prepareShare() async {
-        guard let webView = state.webView, let url = state.currentURL ?? proxyURL else { return }
+    private func prepareShare(session: WebAppSession) async {
+        let state = session.state
+        guard let webView = state.webView, let url = state.currentURL ?? session.proxyURL else { return }
         state.isPreparingShare = true
         defer { state.isPreparingShare = false }
 
@@ -603,9 +693,7 @@ struct AppWebView: View {
 
 struct WebViewRepresentable: UIViewRepresentable {
     let url: URL
-    let state: WebViewState
-    /// Which server/app this web view belongs to — the key for learned names.
-    let nodeId: String
+    let session: WebAppSession
     let appName: String
     var onNameLearned: (String) -> Void = { _ in }
 
@@ -614,6 +702,16 @@ struct WebViewRepresentable: UIViewRepresentable {
     }
 
     func makeUIView(context: Context) -> WKWebView {
+        // Reuse the session's web view when it exists: a background session's
+        // page must reappear exactly as it was (never a fresh blank view —
+        // the load-skip rule in updateUIView depends on this).
+        if let existing = session.webView {
+            existing.navigationDelegate = context.coordinator
+            existing.uiDelegate = context.coordinator
+            session.state.webView = existing
+            context.coordinator.startObserving(existing)
+            return existing
+        }
         let config = WKWebViewConfiguration()
         // Persistent store so cookies/localStorage survive app relaunches; the
         // stable proxy port keeps the origin stable too.
@@ -637,7 +735,9 @@ struct WebViewRepresentable: UIViewRepresentable {
         // clear of the notch/home indicator. Match the overscroll background to
         // the system so the bands above/below never flash white.
         webView.underPageBackgroundColor = .systemBackground
-        state.webView = webView
+        // The session strongly owns the web view (across detaches).
+        session.webView = webView
+        session.state.webView = webView
         context.coordinator.startObserving(webView)
         return webView
     }
@@ -646,27 +746,31 @@ struct WebViewRepresentable: UIViewRepresentable {
         // Keep the coordinator's copy fresh so the learned-name callback and its
         // key stay current across SwiftUI re-evaluations.
         context.coordinator.parent = self
-        if context.coordinator.lastURL != url {
-            context.coordinator.lastURL = url
+        // A re-attached (background) web view keeps its page. The loaded-URL
+        // memory lives on the SESSION, not the coordinator: a re-attached view
+        // gets a fresh coordinator per re-presentation, so a stale nil there
+        // would reload (and reset) the warm page.
+        if session.lastLoadedURL != url {
+            session.lastLoadedURL = url
             let request = URLRequest(url: url)
             webView.load(request)
         }
     }
 
     static func dismantleUIView(_ webView: WKWebView, coordinator: Coordinator) {
+        // Detaching the view does NOT close the session (background apps keep
+        // running). The web view and its observers live on the session's state
+        // and are cleaned up by the session manager on explicit close. Simply
+        // clear the presenter reference.
         coordinator.stopObserving()
-        coordinator.parent.state.webView = nil
     }
 
     class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDelegate {
         var parent: WebViewRepresentable
-        var lastURL: URL?
         private var canGoBackObservation: NSKeyValueObservation?
         private var canGoForwardObservation: NSKeyValueObservation?
         private var fullscreenObservation: NSKeyValueObservation?
         private var titleObservation: NSKeyValueObservation?
-        /// The first meaningful title of this visit has been recorded.
-        private var capturedTitle = false
         private var downloadDestinations: [ObjectIdentifier: URL] = [:]
 
         init(_ parent: WebViewRepresentable) {
@@ -679,12 +783,12 @@ struct WebViewRepresentable: UIViewRepresentable {
         func startObserving(_ webView: WKWebView) {
             canGoBackObservation = webView.observe(\.canGoBack, options: [.initial, .new]) { [weak self] webView, _ in
                 MainActor.assumeIsolated {
-                    self?.parent.state.canGoBack = webView.canGoBack
+                    self?.parent.session.state.canGoBack = webView.canGoBack
                 }
             }
             canGoForwardObservation = webView.observe(\.canGoForward, options: [.initial, .new]) { [weak self] webView, _ in
                 MainActor.assumeIsolated {
-                    self?.parent.state.canGoForward = webView.canGoForward
+                    self?.parent.session.state.canGoForward = webView.canGoForward
                 }
             }
             // Hide the floating control while an element is truly fullscreen
@@ -693,24 +797,27 @@ struct WebViewRepresentable: UIViewRepresentable {
                 let fullscreen = webView.fullscreenState == .enteringFullscreen
                     || webView.fullscreenState == .inFullscreen
                 DispatchQueue.main.async {
-                    self?.parent.state.isFullscreen = fullscreen
+                    self?.parent.session.state.isFullscreen = fullscreen
                 }
             }
             // The server names discovered apps from the HTML `<title>` of `GET /`,
             // which a JS-titled or auth-gated app never exposes. The live web
             // view title does, so record the first meaningful one of this visit
             // (the entry page's, before the user navigates deeper) as the app's
-            // display name.
+            // display name. Once per SESSION, not per representation: a fresh
+            // coordinator on re-attach must not overwrite the recorded name
+            // with a deeper page's title.
             titleObservation = webView.observe(\.title, options: [.initial, .new]) { [weak self] webView, _ in
                 MainActor.assumeIsolated {
-                    guard let self, !self.capturedTitle, let rawTitle = webView.title else { return }
+                    guard let self, let rawTitle = webView.title else { return }
                     let parent = self.parent
+                    guard !parent.session.capturedTitle else { return }
                     guard let name = AppNameStore.remember(
                         rawTitle,
-                        nodeId: parent.nodeId,
+                        nodeId: parent.session.key.nodeId,
                         app: parent.appName
                     ) else { return }
-                    self.capturedTitle = true
+                    parent.session.capturedTitle = true
                     parent.onNameLearned(name)
                 }
             }
@@ -729,15 +836,15 @@ struct WebViewRepresentable: UIViewRepresentable {
 
         func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
             DispatchQueue.main.async {
-                self.parent.state.isLoading = true
-                self.parent.state.errorMessage = nil
+                self.parent.session.state.isLoading = true
+                self.parent.session.state.errorMessage = nil
             }
         }
 
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
             DispatchQueue.main.async {
-                self.parent.state.isLoading = false
-                self.parent.state.currentURL = webView.url
+                self.parent.session.state.isLoading = false
+                self.parent.session.state.currentURL = webView.url
             }
         }
 
@@ -757,11 +864,11 @@ struct WebViewRepresentable: UIViewRepresentable {
         private func finishNavigation(with error: Error) {
             let benign = WebNavigationError.isBenign(error)
             DispatchQueue.main.async {
-                self.parent.state.isLoading = false
+                self.parent.session.state.isLoading = false
                 if benign {
-                    self.parent.state.errorMessage = nil
+                    self.parent.session.state.errorMessage = nil
                 } else {
-                    self.parent.state.errorMessage = error.localizedDescription
+                    self.parent.session.state.errorMessage = error.localizedDescription
                 }
             }
         }
@@ -846,7 +953,7 @@ struct WebViewRepresentable: UIViewRepresentable {
         /// The top-most view controller, for presenting alerts.
         @MainActor
         private func topViewController() -> UIViewController? {
-            var top = parent.state.webView?.window?.rootViewController
+            var top = parent.session.state.webView?.window?.rootViewController
             while let presented = top?.presentedViewController {
                 top = presented
             }
@@ -864,8 +971,8 @@ struct WebViewRepresentable: UIViewRepresentable {
                 let mime = navigationResponse.response.mimeType
                 let url = navigationResponse.response.url
                 DispatchQueue.main.async {
-                    self.parent.state.currentMimeType = mime
-                    if let url { self.parent.state.currentURL = url }
+                    self.parent.session.state.currentMimeType = mime
+                    if let url { self.parent.session.state.currentURL = url }
                 }
             }
 
@@ -910,7 +1017,7 @@ struct WebViewRepresentable: UIViewRepresentable {
             try? FileManager.default.removeItem(at: dest)
             downloadDestinations[ObjectIdentifier(download)] = dest
             DispatchQueue.main.async {
-                self.parent.state.downloadStarted(named: name)
+                self.parent.session.state.downloadStarted(named: name)
             }
             completionHandler(dest)
         }
@@ -921,9 +1028,9 @@ struct WebViewRepresentable: UIViewRepresentable {
             DispatchQueue.main.async {
                 // Clear the banner first: `dest` can be nil, and the indicator
                 // must not be left behind.
-                self.parent.state.downloadFinished()
+                self.parent.session.state.downloadFinished()
                 if let dest {
-                    self.parent.state.shareRequest = ShareRequest(items: [dest])
+                    self.parent.session.state.shareRequest = ShareRequest(items: [dest])
                 }
             }
         }
@@ -935,8 +1042,8 @@ struct WebViewRepresentable: UIViewRepresentable {
         ) {
             downloadDestinations.removeValue(forKey: ObjectIdentifier(download))
             DispatchQueue.main.async {
-                self.parent.state.downloadFinished()
-                self.parent.state.shareError = error.localizedDescription
+                self.parent.session.state.downloadFinished()
+                self.parent.session.state.shareError = error.localizedDescription
             }
         }
     }

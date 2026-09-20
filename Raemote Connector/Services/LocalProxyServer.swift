@@ -12,11 +12,21 @@ import Network
 nonisolated final class LocalProxyServer: @unchecked Sendable {
     private let queue = DispatchQueue(label: "com.raemote.LocalProxyServer")
     private let appName: String
+    /// The server whose `/app/{name}` route this proxy relays to. Streams are
+    /// opened on that server's connection; tunnels must never ride another
+    /// server's connection.
+    private let nodeId: String
     private let service: IrohService
     private let preferredPort: UInt16?
     private var listener: NWListener?
+    /// Accepted connections still being relayed, tracked so `stop()` can end
+    /// every tunnel deterministically (an abandoned pump would keep its NWConnection
+    /// and its iroh stream alive with no owner after the session is closed).
+    /// All access is on `queue`.
+    private var tunnels: [ObjectIdentifier: NWConnection] = [:]
 
-    init(appName: String, service: IrohService, preferredPort: UInt16? = nil) {
+    init(nodeId: String, appName: String, service: IrohService, preferredPort: UInt16? = nil) {
+        self.nodeId = nodeId
         self.appName = appName
         self.service = service
         self.preferredPort = preferredPort
@@ -72,16 +82,45 @@ nonisolated final class LocalProxyServer: @unchecked Sendable {
     }
 
     func stop() {
+        // Queue-serialized fence: end the listener AND every live tunnel, so
+        // no pump outlives its owner. Pumps observe the cancellation as a
+        // receive/send error and exit.
+        queue.async(execute: teardownListenerAndTunnels)
+    }
+
+    /// Runs on `queue`.
+    private func teardownListenerAndTunnels() {
         listener?.cancel()
         listener = nil
+        for connection in tunnels.values {
+            connection.cancel()
+        }
+        tunnels.removeAll()
     }
 
     // MARK: - Connection handling
 
     private func handle(_ connection: NWConnection) {
+        // Track the tunnel so stop() can end it deterministically.
+        queue.async(execute: { self.track(connection) })
         connection.start(queue: queue)
-        let tunnel = ProxyTunnel(connection: connection, appName: appName, service: service)
-        Task { await tunnel.start() }
+        let tunnel = ProxyTunnel(connection: connection, appName: appName, service: service, nodeId: nodeId)
+        Task.detached { [weak self] in
+            await tunnel.start()
+            // The pump finished (stream end, error, or listener teardown):
+            // drop the tracked entry.
+            self?.untrack(connection)
+        }
+    }
+
+    /// Runs on `queue`.
+    private func track(_ connection: NWConnection) {
+        tunnels[ObjectIdentifier(connection)] = connection
+    }
+
+    /// Runs on `queue`.
+    private func untrack(_ connection: NWConnection) {
+        tunnels.removeValue(forKey: ObjectIdentifier(connection))
     }
 }
 
