@@ -121,6 +121,26 @@ final class IrohConnectionMonitor {
     var path: IrohPathState?
 }
 
+/// Whether a cached serve connection may be reused without reconnecting.
+///
+/// A connection idle past `staleAfter` is **not trusted**: the server process
+/// may have restarted since (same identity, new sockets), and QUIC will not
+/// report the old connection dead until its own idle timeout (~30 s), so a
+/// request would hang until then. Reconnecting is cheap; hanging is not. While
+/// a stream is open the connection is demonstrably alive, so a long-lived
+/// tunnel is never torn down by the window.
+nonisolated enum ConnectionFreshness {
+    /// How long a connection may sit idle before the client refuses to reuse it.
+    /// Kept well under the QUIC idle timeout so we reconnect before the
+    /// protocol would notice a dead peer.
+    static let staleAfter: TimeInterval = 10
+
+    static func isTrustworthy(lastUsed: Date, hasOpenStream: Bool, now: Date = .now) -> Bool {
+        if hasOpenStream { return true }
+        return now.timeIntervalSince(lastUsed) < staleAfter
+    }
+}
+
 actor IrohService {
     private let monitor: IrohConnectionMonitor
     private var endpoint: Endpoint?
@@ -129,7 +149,7 @@ actor IrohService {
     /// rule: a node's connection is its own). Web views of different servers
     /// can stream simultaneously, so connections must not be swapped under
     /// each other; `openStream(nodeId:)` binds a tunnel to its own server.
-    private var connections: [String: Connection] = [:]
+    private var connections: [String: ServeConnection] = [:]
     /// The drop-watcher task per live connection.
     private var watchers: [String: Task<Void, Never>] = [:]
     /// The server the UI (detail/web view) is focused on: the monitor's state
@@ -139,6 +159,19 @@ actor IrohService {
     /// In-flight connect tasks per node, so a burst of callers (web view +
     /// revalidation) shares one dial instead of racing several.
     private var connecting: [String: Task<Connection, Error>] = [:]
+    /// Consecutive connect failures per node, used to decide when the endpoint
+    /// (and with it its cached peer addresses) is worth rebuilding.
+    private var connectFailures: [String: Int] = [:]
+    /// Open stream count per node (a live tunnel keeps its connection fresh).
+    private var openStreams: [String: Int] = [:]
+
+    /// A live serve connection bound to the node it belongs to, stamped with
+    /// the last time it carried traffic.
+    private struct ServeConnection {
+        let nodeId: String
+        let conn: Connection
+        var lastUsed: Date
+    }
 
     private static let bindAlpn = Data("raemote/bind/0".utf8)
     private static let serveAlpn = Data("raemote/0".utf8)
@@ -146,6 +179,9 @@ actor IrohService {
     /// Generous budgets so a stuck peer can't hang the UI forever.
     private static let connectTimeout: Double = 15
     private static let requestTimeout: Double = 20
+    /// The foreground liveness probe is a tiny request on a possibly-dead
+    /// connection, so it uses a short deadline and recovers quickly.
+    private static let validateTimeout: Double = 5
 
     init(monitor: IrohConnectionMonitor) {
         self.monitor = monitor
@@ -264,7 +300,7 @@ actor IrohService {
     /// node the UI is presenting (monitor state + default HTTP target).
     func ensureConnection(nodeId: String, focus: Bool = true) async throws {
         if focus { await setFocus(nodeId) }
-        if let conn = connections[nodeId], conn.closeReason() == nil {
+        if reliableConnection(nodeId) != nil {
             if focus { await setState(.connected) }
             return
         }
@@ -286,36 +322,98 @@ actor IrohService {
     }
 
     /// Actively verify the serve connection (used when the app returns to the
-    /// foreground). Reconnects if the connection is gone or unusable.
+    /// foreground). Reconnects if the connection is gone, stale, or unusable.
     func validateConnection(nodeId: String) async {
         await setFocus(nodeId)
-        // Drop a connection whose close reason is already known.
-        if let conn = connections[nodeId], conn.closeReason() != nil {
-            connections[nodeId] = nil
+        // Drop a connection whose close reason is known, or that has been idle
+        // past the trust window (it may belong to a server process that has
+        // since restarted). `ensureConnection` then dials fresh.
+        if let cached = connections[nodeId],
+           cached.conn.closeReason() != nil
+            || !ConnectionFreshness.isTrustworthy(
+                lastUsed: cached.lastUsed,
+                hasOpenStream: (openStreams[nodeId] ?? 0) > 0
+            ) {
+            retire(nodeId, matching: cached.conn, reason: "stale")
         }
         do {
             try await ensureConnection(nodeId: nodeId)
         } catch {
             return
         }
-        // Confirm it is actually usable; `send` self-heals if it is half-dead.
+        // Confirm it is actually usable. A short deadline means a dead
+        // connection is detected in seconds, not the full request timeout.
         do {
-            _ = try await httpRequest(method: "GET", path: "/_hub/catalog", nodeId: nodeId)
+            _ = try await httpRequest(
+                method: "GET",
+                path: "/_hub/catalog",
+                nodeId: nodeId,
+                timeout: Self.validateTimeout
+            )
             await setState(.connected)
         } catch {
+            retire(nodeId, matching: connections[nodeId]?.conn, reason: "validation failed")
             await setState(.disconnected("connection unusable"))
         }
+    }
+
+    /// The cached connection for `nodeId`, but only when it is alive and either
+    /// recently used or carrying an open stream. A stale entry is retired here
+    /// (and closed, so the server drops it immediately) and `nil` returned, so
+    /// the caller dials a fresh connection.
+    private func reliableConnection(_ nodeId: String) -> Connection? {
+        guard let cached = connections[nodeId] else { return nil }
+        guard cached.conn.closeReason() == nil else {
+            retire(nodeId, matching: cached.conn, reason: "closed")
+            return nil
+        }
+        let hasStream = (openStreams[nodeId] ?? 0) > 0
+        guard ConnectionFreshness.isTrustworthy(lastUsed: cached.lastUsed, hasOpenStream: hasStream)
+        else {
+            let idle = Int(Date().timeIntervalSince(cached.lastUsed))
+            print("[IrohService] dropping idle connection to \(nodeId.prefix(8)) (idle \(idle)s)")
+            retire(nodeId, matching: cached.conn, reason: "stale")
+            return nil
+        }
+        return cached.conn
+    }
+
+    /// Drop (and close) the cached connection for `nodeId`, but only when it is
+    /// still `matching`, so a concurrent reconnect is never torn down. Closing
+    /// tells iroh — and, when reachable, the server — to drop it now instead of
+    /// waiting out the idle timeout.
+    @discardableResult
+    private func retire(_ nodeId: String, matching conn: Connection?, reason: String) -> Bool {
+        guard let current = connections[nodeId],
+              conn == nil || current.conn === conn
+        else { return false }
+        connections[nodeId] = nil
+        watchers[nodeId]?.cancel()
+        watchers[nodeId] = nil
+        try? current.conn.close(errorCode: 0, reason: Data(reason.utf8))
+        return true
+    }
+
+    /// Record that `conn` just carried traffic, so it stays "fresh".
+    private func markUsed(_ nodeId: String, _ conn: Connection) {
+        guard var cached = connections[nodeId], cached.conn === conn else { return }
+        cached.lastUsed = .now
+        connections[nodeId] = cached
+    }
+
+    /// Close and forget `nodeId`'s connection so the next request reconnects.
+    /// Used when a tunnel proves the connection dead (or the user asks).
+    func invalidateConnection(nodeId: String) async {
+        retire(nodeId, matching: connections[nodeId]?.conn, reason: "invalidated")
     }
 
     /// Connect (or wait for an in-flight connect) over the serve ALPN and
     /// register the connection for `nodeId`.
     private func connectAndAdopt(nodeId: String, timeout: Double?) async throws -> Connection {
-        if let existing = connections[nodeId], existing.closeReason() == nil {
+        if let existing = reliableConnection(nodeId) {
             return existing
         }
-        connections[nodeId] = nil
-        watchers[nodeId]?.cancel()
-        watchers[nodeId] = nil
+        retire(nodeId, matching: connections[nodeId]?.conn, reason: "reconnect")
         if let inflight = connecting[nodeId], !inflight.isCancelled {
             return try await inflight.value
         }
@@ -327,7 +425,36 @@ actor IrohService {
         }
         connecting[nodeId] = task
         defer { connecting[nodeId] = nil }
-        return try await task.value
+        do {
+            let conn = try await task.value
+            connectFailures[nodeId] = nil
+            return conn
+        } catch {
+            // A rejected (revoked) device is not a discovery problem; retrying
+            // with a fresh endpoint would churn for nothing.
+            if case IrohError.bindDenied = error {
+                throw error
+            }
+            await noteConnectFailure(nodeId)
+            throw error
+        }
+    }
+
+    /// A dial failed. After a couple in a row, rebuild the endpoint so address
+    /// discovery runs from scratch — that is what recovers when the *cached*
+    /// address of a restarted server has gone stale. Only done when no live
+    /// connection exists: a working connection to another server proves
+    /// discovery is fine and must not be torn down.
+    private func noteConnectFailure(_ nodeId: String) async {
+        let failures = (connectFailures[nodeId] ?? 0) + 1
+        connectFailures[nodeId] = failures
+        let hasLiveConnection = connections.values.contains { $0.conn.closeReason() == nil }
+        guard failures >= 2, !hasLiveConnection else { return }
+        connectFailures[nodeId] = nil
+        guard let stale = endpoint else { return }
+        print("[IrohService] \(failures) failed dials to \(nodeId.prefix(8)); rebuilding the endpoint to redo discovery")
+        endpoint = nil
+        try? await stale.close()
     }
 
     /// Connect over the serve ALPN. `timeout` of `nil` waits indefinitely (used
@@ -362,7 +489,7 @@ actor IrohService {
                 "server rejected the connection (node not authorized) — set up the server link again [\(reason)]"
             )
         }
-        connections[nodeId] = conn
+        connections[nodeId] = ServeConnection(nodeId: nodeId, conn: conn, lastUsed: .now)
         watchers[nodeId]?.cancel()
         // The watcher is bound to THIS connection, not the node key: if the
         // connection drops after a reconnect already adopted a newer one, the
@@ -385,10 +512,13 @@ actor IrohService {
     /// `paths()` (a plain snapshot, no spawn) is the safe surface. A couple of
     /// seconds of lag is fine for a transport indicator.
     func refreshPathKind(nodeId: String) async {
-        guard let conn = connections[nodeId], conn.closeReason() == nil else {
+        // Only sample an alive connection; an idle one is left alone here (the
+        // staleness window is applied when it is next *used*, never by polling,
+        // so a running-but-quiet tunnel is not torn down).
+        guard let cached = connections[nodeId], cached.conn.closeReason() == nil else {
             return
         }
-        let kind = IrohPathKind(paths: conn.paths().map(IrohPathFacts.init))
+        let kind = IrohPathKind(paths: cached.conn.paths().map(IrohPathFacts.init))
         await MainActor.run { monitor.path = IrohPathState(nodeId: nodeId, kind: kind) }
     }
 
@@ -396,7 +526,7 @@ actor IrohService {
         // Identity fence: only retire the map entry this watcher was created
         // for. A dropped OLD connection after a reconnect must not tear down
         // the live one.
-        guard connections[nodeId] === conn else { return }
+        guard connections[nodeId]?.conn === conn else { return }
         connections[nodeId] = nil
         watchers[nodeId]?.cancel()
         watchers[nodeId] = nil
@@ -426,7 +556,8 @@ actor IrohService {
         path: String,
         nodeId: String? = nil,
         body: Data? = nil,
-        contentType: String = "application/json"
+        contentType: String = "application/json",
+        timeout: Double? = nil
     ) async throws -> (Int, Data) {
         var head = "\(method) \(path) HTTP/1.1\r\nHost: raemote\r\n"
         if let body, !body.isEmpty {
@@ -442,7 +573,7 @@ actor IrohService {
         let raw = try await send(
             request,
             sizeLimit: 1_000_000,
-            timeout: Self.requestTimeout,
+            timeout: timeout ?? Self.requestTimeout,
             nodeId: nodeId
         )
         return try Self.parseHttpResponse(raw)
@@ -458,30 +589,35 @@ actor IrohService {
         guard let nodeId = explicitNodeId ?? activeNodeId else {
             throw IrohError.connectionFailed("Not bound")
         }
-        if let conn = connections[nodeId], conn.closeReason() == nil {
+        // Reuse only a connection that is alive and not suspiciously idle; a
+        // fresh dial is cheap, a hang on a connection whose server has
+        // restarted is not.
+        if let conn = reliableConnection(nodeId) {
             do {
-                return try await withTimeout(timeout) {
+                let data = try await withTimeout(timeout) {
                     try await Self.exchange(conn, requestData: requestData, sizeLimit: sizeLimit)
                 }
+                markUsed(nodeId, conn)
+                return data
             } catch {
                 print("[IrohService] request failed, will reconnect: \(error)")
                 // Only retire the entry that actually failed: a concurrent
                 // reconnect may have adopted a different connection under the
                 // same key while this exchange was in flight.
-                if connections[nodeId] === conn {
-                    connections[nodeId] = nil
-                }
+                retire(nodeId, matching: conn, reason: "request failed")
             }
         }
 
         _ = try await connectAndAdopt(nodeId: nodeId, timeout: Self.connectTimeout)
-        guard let conn = connections[nodeId] else {
+        guard let conn = connections[nodeId]?.conn else {
             throw IrohError.connectionFailed("connection lost")
         }
         do {
-            return try await withTimeout(timeout) {
+            let data = try await withTimeout(timeout) {
                 try await Self.exchange(conn, requestData: requestData, sizeLimit: sizeLimit)
             }
+            markUsed(nodeId, conn)
+            return data
         } catch {
             if nodeId == activeNodeId {
                 await setState(.disconnected(error.localizedDescription))
@@ -500,10 +636,31 @@ actor IrohService {
     /// streaming proxy). Unlike `relay`, the caller owns both halves and pumps
     /// bytes. The node is explicit so a tunnel can never ride another server's
     /// connection.
+    ///
+    /// While this stream is open the connection counts as fresh, so a
+    /// long-lived tunnel is never dropped by the idle window; call
+    /// `streamFinished(nodeId:)` when the tunnel ends.
     func openStream(nodeId: String) async throws -> RawStream {
         let conn = try await connectAndAdopt(nodeId: nodeId, timeout: Self.connectTimeout)
-        let bi = try await conn.openBi()
-        return RawStream(send: bi.send(), recv: bi.recv())
+        let stream = try await withTimeout(Self.requestTimeout) {
+            let bi = try await conn.openBi()
+            return RawStream(send: bi.send(), recv: bi.recv())
+        }
+        openStreams[nodeId, default: 0] += 1
+        markUsed(nodeId, conn)
+        return stream
+    }
+
+    /// The tunnel using `nodeId`'s stream has ended.
+    func streamFinished(nodeId: String) {
+        if let count = openStreams[nodeId], count > 1 {
+            openStreams[nodeId] = count - 1
+        } else {
+            openStreams[nodeId] = nil
+        }
+        if let conn = connections[nodeId]?.conn {
+            markUsed(nodeId, conn)
+        }
     }
 
     private nonisolated static func exchange(
@@ -564,6 +721,24 @@ actor IrohService {
             throw IrohError.http(status: status, body: body)
         }
         return try JSONDecoder().decode(ServerInfo.self, from: body)
+    }
+
+    /// Fetch an app's icon through its `/app/{name}` route. `path` is the
+    /// same-origin icon path the server's discovery reported; when it is
+    /// absent (a manual app, or an older server) the conventional
+    /// `/favicon.ico` is tried instead.
+    func fetchIcon(nodeId: String, app: String, path: String?) async throws -> Data {
+        let trimmed = path?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let iconPath = trimmed.hasPrefix("/") ? trimmed : "/favicon.ico"
+        let (status, body) = try await httpRequest(
+            method: "GET",
+            path: "/app/\(app)\(iconPath)",
+            nodeId: nodeId
+        )
+        guard status == 200 else {
+            throw IrohError.http(status: status, body: body)
+        }
+        return body
     }
 
     // MARK: - Invitations
@@ -646,12 +821,13 @@ actor IrohService {
         for watcher in watchers.values {
             watcher.cancel()
         }
-        for conn in connections.values {
-            try? conn.close(errorCode: 0, reason: Data("bye".utf8))
+        for cached in connections.values {
+            try? cached.conn.close(errorCode: 0, reason: Data("bye".utf8))
         }
         connections.removeAll()
         watchers.removeAll()
         connecting.removeAll()
+        openStreams.removeAll()
         activeNodeId = nil
         endpoint = nil
         await setState(.unknown)

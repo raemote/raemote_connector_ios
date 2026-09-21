@@ -8,9 +8,9 @@ struct ServerDetailView: View {
     let onAppsUpdated: ([AppInfo]) -> Void
     let onAliasChange: (String) -> Void
     let onReportedName: (String) -> Void
-    /// The user tapped another running app in the web-view strip; the router
-    /// (the server list) decides how to present it. Current stays warm.
-    let onSwitchSession: (WebAppSessionKey) -> Void
+    /// The user tapped an app; the root list owns the navigation stack, so it
+    /// presents the app (creating/activating its session).
+    let onOpenApp: (WebAppSessionKey) -> Void
 
     @State private var apps: [AppInfo]
     /// Display names learned from each app's live page title, keyed by the
@@ -51,7 +51,7 @@ struct ServerDetailView: View {
         onAppsUpdated: @escaping ([AppInfo]) -> Void,
         onAliasChange: @escaping (String) -> Void,
         onReportedName: @escaping (String) -> Void,
-        onSwitchSession: @escaping (WebAppSessionKey) -> Void
+        onOpenApp: @escaping (WebAppSessionKey) -> Void
     ) {
         self.server = server
         self.irohService = irohService
@@ -60,7 +60,7 @@ struct ServerDetailView: View {
         self.onAppsUpdated = onAppsUpdated
         self.onAliasChange = onAliasChange
         self.onReportedName = onReportedName
-        self.onSwitchSession = onSwitchSession
+        self.onOpenApp = onOpenApp
         _apps = State(initialValue: server.apps)
         _appNames = State(initialValue: AppNameStore.names(nodeId: server.nodeId))
         _launchPaths = State(initialValue: AppLaunchStore.paths(nodeId: server.nodeId))
@@ -86,28 +86,17 @@ struct ServerDetailView: View {
                     )
                 } else {
                     ForEach(apps) { app in
-                        NavigationLink(value: app) {
+                        Button {
+                            onOpenApp(WebAppSessionKey(nodeId: server.nodeId, app: app.name))
+                        } label: {
                             appRow(app)
                         }
+                        .buttonStyle(.plain)
                     }
                 }
             }
         }
         .navigationTitle(displayTitle)
-        .navigationDestination(for: AppInfo.self) { app in
-            AppWebView(
-                app: app,
-                nodeId: server.nodeId,
-                irohService: irohService,
-                monitor: monitor,
-                sessionManager: sessionManager,
-                launchPath: launchPaths[app.name],
-                onNameLearned: { name in
-                    appNames[app.name] = name
-                },
-                onSwitchSession: onSwitchSession
-            )
-        }
         .toolbar {
             // One "…" menu for all server actions — add future actions here.
             ToolbarItem(placement: .primaryAction) {
@@ -335,29 +324,37 @@ struct ServerDetailView: View {
     }
 
     private func appRow(_ app: AppInfo) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack(spacing: 6) {
-                // Green dot = the app is running in the background; tapping
-                // resumes it warm instead of reconnecting/reopening.
-                if sessionManager.isRunning(nodeId: server.nodeId, app: app.name) {
-                    Circle()
-                        .fill(.green)
-                        .frame(width: 8, height: 8)
-                        .accessibilityLabel("Running")
+        HStack(spacing: 10) {
+            AppIconView(nodeId: server.nodeId, app: app.name, service: irohService)
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 6) {
+                    // Green dot = the app is running in the background; tapping
+                    // resumes it warm instead of reconnecting/reopening.
+                    if sessionManager.isRunning(nodeId: server.nodeId, app: app.name) {
+                        Circle()
+                            .fill(.green)
+                            .frame(width: 8, height: 8)
+                            .accessibilityLabel("Running")
+                    }
+                    Text(appNames[app.name] ?? app.name)
+                        .font(.headline)
+                    if launchPaths[app.name] != nil {
+                        Image(systemName: "link")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                            .accessibilityLabel("Opens with a launch URL")
+                    }
                 }
-                Text(appNames[app.name] ?? app.name)
-                    .font(.headline)
-                if launchPaths[app.name] != nil {
-                    Image(systemName: "link")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.secondary)
-                        .accessibilityLabel("Opens with a launch URL")
-                }
+                Text("\(app.port)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
-            Text("\(app.port)")
-                .font(.caption)
-                .foregroundStyle(.secondary)
+            Spacer(minLength: 0)
+            Image(systemName: "chevron.forward")
+                .font(.footnote.weight(.semibold))
+                .foregroundStyle(.tertiary)
         }
+        .contentShape(Rectangle())
         .padding(.vertical, 4)
         .contextMenu {
             Button("Launch URL…", systemImage: "link") {

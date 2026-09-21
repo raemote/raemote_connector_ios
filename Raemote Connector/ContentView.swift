@@ -1,15 +1,14 @@
 import SwiftUI
 
-/// A pushable route for a web app, registered at the ROOT of the navigation
-/// stack so the running-apps list (and any cross-session switch) can present
-/// the app directly — without first walking through the server's detail view.
-/// Distinct from `AppInfo` (whose destination lives inside `ServerDetailView`)
-/// so both can coexist in one stack without colliding destinations.
-struct RunningAppRoute: Hashable {
-    let nodeId: String
-    let app: String
-    /// Upstream app port, display only (`0` when unknown/offline).
-    let port: Int
+/// A destination in the root navigation stack.
+///
+/// `.app` is a single host screen whose *content* follows
+/// `sessionManager.activeKey`, not a per-app route. Switching apps therefore
+/// only changes `activeKey`, so the stack never churns and the presented web
+/// view is always the active session's.
+enum Route: Hashable {
+    case server(Server)
+    case app
 }
 
 struct ContentView: View {
@@ -28,10 +27,14 @@ struct ContentView: View {
     /// Registry of simultaneously running web apps (cap 5, LRU eviction);
     /// sessions keep running when the user navigates away from them.
     @State private var sessionManager: WebAppSessionManager
-    @State private var path = NavigationPath()
+    @State private var path: [Route] = []
     @State private var pendingDeepLink: DeepLink?
     /// Set once after the first successful pairing, to show the network tip.
     @State private var firstPairingName: String?
+    /// Throttles the foreground catalog refresh.
+    @State private var lastCatalogRefresh: Date = .distantPast
+
+    @Environment(\.scenePhase) private var scenePhase
 
     private let storageKey = "boundServers"
 
@@ -59,7 +62,7 @@ struct ContentView: View {
                     )
                 } else {
                     ForEach(servers) { server in
-                        NavigationLink(value: server) {
+                        NavigationLink(value: Route.server(server)) {
                             serverRow(server)
                         }
                     }
@@ -67,28 +70,8 @@ struct ContentView: View {
                 }
             }
             .navigationTitle("Raemote")
-            .navigationDestination(for: RunningAppRoute.self) { route in
-                appRouteView(route)
-            }
-            .navigationDestination(for: Server.self) { server in
-                ServerDetailView(
-                    server: server,
-                    irohService: irohService,
-                    monitor: connectionMonitor,
-                    sessionManager: sessionManager,
-                    onAppsUpdated: { apps in
-                        updateServerApps(nodeId: server.nodeId, apps: apps)
-                    },
-                    onAliasChange: { alias in
-                        updateServerAlias(nodeId: server.nodeId, alias: alias)
-                    },
-                    onReportedName: { name in
-                        updateServerReportedName(nodeId: server.nodeId, reportedName: name)
-                    },
-                    onSwitchSession: { key in
-                        openRunningSession(key)
-                    }
-                )
+            .navigationDestination(for: Route.self) { route in
+                destination(for: route)
             }
             .toolbar {
                 ToolbarItem(placement: .primaryAction) {
@@ -170,13 +153,46 @@ struct ContentView: View {
                 if let link = pendingDeepLink {
                     resolve(link)
                 }
+                await refreshCatalogsIfStale()
+            }
+            .onChange(of: scenePhase) { _, phase in
+                guard phase == .active else { return }
+                Task { await refreshCatalogsIfStale() }
             }
             .onOpenURL { handleDeepLink($0) }
         }
     }
 
-    // MARK: - Manual Setup Sheet
+    /// Root-level destinations. Extracted from `body` so the type-checker does
+    /// not have to solve one enormous expression.
+    @ViewBuilder
+    private func destination(for route: Route) -> some View {
+        switch route {
+        case .server(let server):
+            ServerDetailView(
+                server: server,
+                irohService: irohService,
+                monitor: connectionMonitor,
+                sessionManager: sessionManager,
+                onAppsUpdated: { updateServerApps(nodeId: server.nodeId, apps: $0) },
+                onAliasChange: { updateServerAlias(nodeId: server.nodeId, alias: $0) },
+                onReportedName: { updateServerReportedName(nodeId: server.nodeId, reportedName: $0) },
+                onOpenApp: { openApp($0) }
+            )
+        case .app:
+            AppHostView(
+                sessionManager: sessionManager,
+                irohService: irohService,
+                monitor: connectionMonitor,
+                onSwitchSession: { switchApp($0) },
+                onAppsUpdated: { nodeId, apps in
+                    updateServerApps(nodeId: nodeId, apps: apps)
+                }
+            )
+        }
+    }
 
+    // MARK: - Manual Setup Sheet
     private var manualSetupSheet: some View {
         NavigationStack {
             Form {
@@ -304,6 +320,7 @@ struct ContentView: View {
                 } else {
                     servers.append(server)
                 }
+                AppIconStore.shared.register(nodeId: nodeId, apps: apps)
                 saveServers()
 
                 if isFirstPairing, OnboardingStore.shouldShowNetworkTip() {
@@ -349,29 +366,38 @@ struct ContentView: View {
         }
     }
 
-    /// A running app row: green dot + app name + server name; tap resumes the
-    /// warm session via the root-level route (same presenter the strip and the
-    /// detail view use); long-press closes it.
+    /// A running app row: icon + green dot + app name + server name; tap resumes
+    /// the warm session; long-press closes it.
     private func runningRow(_ session: WebAppSession) -> some View {
         let key = session.key
-        let route = routeFor(key)
         let appName = AppNameStore.name(nodeId: key.nodeId, app: key.app) ?? key.app
         let server = servers.first { $0.nodeId == key.nodeId }
         let serverName = server?.displayName ?? String(key.nodeId.prefix(12)) + "…"
-        return NavigationLink(value: route) {
-            HStack(spacing: 8) {
-                Circle()
-                    .fill(.green)
-                    .frame(width: 9, height: 9)
-                    .accessibilityLabel("Running")
+        return Button {
+            openApp(key)
+        } label: {
+            HStack(spacing: 10) {
+                AppIconView(nodeId: key.nodeId, app: key.app, service: irohService, size: 32)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(appName).font(.headline)
+                    HStack(spacing: 6) {
+                        Circle()
+                            .fill(.green)
+                            .frame(width: 8, height: 8)
+                            .accessibilityLabel("Running")
+                        Text(appName).font(.headline)
+                    }
                     Text(serverName)
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
+                Spacer(minLength: 0)
+                Image(systemName: "chevron.forward")
+                    .font(.footnote.weight(.semibold))
+                    .foregroundStyle(.tertiary)
             }
+            .contentShape(Rectangle())
         }
+        .buttonStyle(.plain)
         .contextMenu {
             Button("Close App", role: .destructive) {
                 sessionManager.close(key)
@@ -379,44 +405,37 @@ struct ContentView: View {
         }
     }
 
-    /// Resolve the root-level push route for a session key; the port comes
-    /// from the server's catalog when it still has the app (display only).
-    private func routeFor(_ key: WebAppSessionKey) -> RunningAppRoute {
-        let server = servers.first { $0.nodeId == key.nodeId }
-        let port = server?.apps.first { $0.name == key.app }?.port
-        return RunningAppRoute(nodeId: key.nodeId, app: key.app, port: port ?? 0)
-    }
+    // MARK: - Presenting apps
 
-    /// The presenter for a root-level running-app route. The web view itself
-    /// persists learned names in `AppNameStore`; the list rows read them on
-    /// rebuild, so the name callback here is a no-op.
-    private func appRouteView(_ route: RunningAppRoute) -> some View {
-        let launchPath = AppLaunchStore.path(nodeId: route.nodeId, app: route.app)
-        let app = AppInfo(name: route.app, path: "", port: route.port)
-        return AppWebView(
-            app: app,
-            nodeId: route.nodeId,
-            irohService: irohService,
-            monitor: connectionMonitor,
-            sessionManager: sessionManager,
-            launchPath: launchPath,
-            onNameLearned: { _ in
-                // no local state to update at the root level
-            },
-            onSwitchSession: { key in
-                openRunningSession(key)
-            }
-        )
-    }
-
-    /// Present a running (or newly opened) session: swap the whole stack to
-    /// the root-level app route. The previously presented session stays warm;
-    /// this only changes focus. Deterministic — no destination-registration
-    /// timing (the route's destination is registered at the root).
-    private func openRunningSession(_ key: WebAppSessionKey) {
+    /// Open an app: ensure its session exists, make it the active one, and push
+    /// the single app host. Called from the server detail and the running list.
+    private func openApp(_ key: WebAppSessionKey) {
+        _ = sessionManager.open(nodeId: key.nodeId, app: key.app)
         sessionManager.activate(key)
-        path = NavigationPath()
-        path.append(routeFor(key))
+        path = Self.pathAfterOpen(from: path)
+    }
+
+    /// Switch the presented app from the in-app strip: swap in place when the
+    /// host is already the top of the stack (no navigation churn), otherwise
+    /// collapse to the host so the back gesture returns to the main list.
+    private func switchApp(_ key: WebAppSessionKey) {
+        _ = sessionManager.open(nodeId: key.nodeId, app: key.app)
+        sessionManager.activate(key)
+        path = Self.pathAfterSwitch(from: path)
+    }
+
+    /// Push exactly one app host, however deep the stack already is. Presenting
+    /// an app twice would be a duplicate destination, so the top is left alone
+    /// when it is already the host.
+    static func pathAfterOpen(from current: [Route]) -> [Route] {
+        current.last == .app ? current : current + [.app]
+    }
+
+    /// A switch collapses the stack to a single app host, so the back gesture
+    /// always returns to the main list; when it is already just the host the
+    /// path is untouched (switching must not churn navigation).
+    static func pathAfterSwitch(from current: [Route]) -> [Route] {
+        current == [.app] ? current : [.app]
     }
 
     private func serverRow(_ server: Server) -> some View {
@@ -473,6 +492,15 @@ struct ContentView: View {
               let decoded = try? JSONDecoder().decode([Server].self, from: data)
         else { return }
         servers = decoded
+        registerAppIcons()
+    }
+
+    /// Tell the icon store where each catalog app keeps its favicon, so rows
+    /// and the switcher strip can load icons by `(nodeId, app)` alone.
+    private func registerAppIcons() {
+        for server in servers {
+            AppIconStore.shared.register(nodeId: server.nodeId, apps: server.apps)
+        }
     }
 
     private func saveServers() {
@@ -498,20 +526,37 @@ struct ContentView: View {
               let server = servers.first(where: { $0.nodeId == nodeId }) else {
             return
         }
-        var newPath = NavigationPath()
-        newPath.append(server)
+        var newPath: [Route] = [.server(server)]
         if let appName = link.appName,
            let app = server.apps.first(where: { $0.name == appName }) {
-            newPath.append(app)
+            _ = sessionManager.open(nodeId: nodeId, app: app.name)
+            sessionManager.activate(WebAppSessionKey(nodeId: nodeId, app: app.name))
+            newPath.append(.app)
         }
         pendingDeepLink = nil
         path = newPath
+    }
+
+    /// Refresh every paired server's catalog when the app returns to the
+    /// foreground (throttled). This is what makes a server that newly reports
+    /// app icons picked up without the user hunting for "Refresh Apps" — and
+    /// the icon rows refetch when the descriptor changes.
+    private func refreshCatalogsIfStale() async {
+        guard Date().timeIntervalSince(lastCatalogRefresh) > 60 else { return }
+        lastCatalogRefresh = .now
+        for server in servers {
+            guard let apps = try? await irohService.fetchCatalog(nodeId: server.nodeId) else {
+                continue
+            }
+            updateServerApps(nodeId: server.nodeId, apps: apps)
+        }
     }
 
     /// Persist a refreshed app list coming back from `ServerDetailView`.
     private func updateServerApps(nodeId: String, apps: [AppInfo]) {
         guard let index = servers.firstIndex(where: { $0.nodeId == nodeId }) else { return }
         servers[index].apps = apps
+        AppIconStore.shared.register(nodeId: nodeId, apps: apps)
         saveServers()
     }
 

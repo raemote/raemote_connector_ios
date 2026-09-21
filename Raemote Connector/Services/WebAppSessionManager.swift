@@ -171,6 +171,9 @@ final class WebAppSessionManager {
     /// Close a running app: stop its loopback proxy and discard the WKWebView.
     /// Site data (cookies/localStorage) is deliberately kept: the stable
     /// origin survives across future runs through `ProxyPortStore`.
+    ///
+    /// Closing the *active* session clears `activeKey`, which is how the
+    /// presented app host learns to leave instead of resurrecting it.
     func close(_ key: WebAppSessionKey) {
         guard let session = sessions.removeValue(forKey: key) else { return }
         orderRemove(key)

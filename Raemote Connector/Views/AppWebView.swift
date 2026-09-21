@@ -19,8 +19,6 @@ final class WebViewState {
     var errorMessage: String?
     var canGoBack = false
     var canGoForward = false
-    /// The floating control is expanded into its card of buttons.
-    var isExpanded = false
     /// The web view is in true (element) fullscreen; hide the control then.
     var isFullscreen = false
     var isPreparingShare = false
@@ -58,28 +56,33 @@ final class WebViewState {
 }
 
 struct AppWebView: View {
-    let app: AppInfo
-    let nodeId: String
+    /// Which app this view presents. The session, launch path, port and learned
+    /// name are all derived from this one key (the NodeId-isolation rule).
+    let key: WebAppSessionKey
     let irohService: IrohService
     let monitor: IrohConnectionMonitor
     /// The running-apps registry: this view presents one session; leaving does
     /// not close it (apps run in the background until the user closes them).
     let sessionManager: WebAppSessionManager
-    /// An optional path/query to open the app with (`AppLaunchStore`), for apps
-    /// whose entry URL carries a one-time token.
-    var launchPath: String?
-    /// Called when the app shows a page title worth remembering.
-    var onNameLearned: (String) -> Void = { _ in }
-    /// The user tapped another running app in the strip; the router decides
-    /// how to present it (the current session stays warm).
+    /// Whether the floating control is expanded. Owned by `AppHostView` so it
+    /// survives switching apps and is the *single* value behind both the card's
+    /// morph and its hit-testing.
+    @Binding var isControlExpanded: Bool
+    /// The user tapped another running app in the strip; the router decides how
+    /// to switch (the current session stays warm).
     var onSwitchSession: (WebAppSessionKey) -> Void = { _ in }
+    /// A refreshed catalog for this server, so the root list can update its app
+    /// lists (and the icon store its descriptors).
+    var onAppsUpdated: (String, [AppInfo]) -> Void = { _, _ in }
 
-    /// This app's running session (created on first appearance).
-    private var sessionKey: WebAppSessionKey {
-        WebAppSessionKey(nodeId: nodeId, app: app.name)
-    }
-    /// The name learned from the live page title, if the app has shown one.
-    @State private var learnedName: String?
+    private var nodeId: String { key.nodeId }
+    private var appName: String { key.app }
+    /// An optional path/query to open the app with (`AppLaunchStore`), for apps
+    /// whose entry URL carries a one-time token. Applies on the first proxy
+    /// start; later activations resume where the page already is.
+    private var launchPath: String? { AppLaunchStore.path(nodeId: key.nodeId, app: key.app) }
+    /// The app's catalog port (display only; `0` when unknown).
+    private var port: Int { AppIconStore.shared.port(nodeId: key.nodeId, app: key.app) }
 
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.dismiss) private var dismiss
@@ -89,15 +92,40 @@ struct AppWebView: View {
     /// Live drag offset while the user moves the circle.
     @State private var dragTranslation: CGSize = .zero
     /// How far the card has morphed out of the circle: 0 = collapsed onto the
-    /// circle, 1 = at its resting place. Animated when `state.isExpanded`
-    /// changes; interpolating it is what makes the card grow out of the button.
+    /// circle, 1 = at its resting place. Interpolating it is what makes the card
+    /// grow out of the button. Kept in sync with `isControlExpanded`.
     @State private var expansion: CGFloat = 0
+    /// A strip refresh (server discovery scan) is in flight.
+    @State private var isRefreshingCatalog = false
 
     private let controlDiameter: CGFloat = 52
 
-    /// What to call this app: the page title learned from the web view, else the
-    /// server's name for it.
-    private var displayName: String { learnedName ?? app.name }
+    init(
+        key: WebAppSessionKey,
+        irohService: IrohService,
+        monitor: IrohConnectionMonitor,
+        sessionManager: WebAppSessionManager,
+        isControlExpanded: Binding<Bool>,
+        onSwitchSession: @escaping (WebAppSessionKey) -> Void = { _ in },
+        onAppsUpdated: @escaping (String, [AppInfo]) -> Void = { _, _ in }
+    ) {
+        self.key = key
+        self.irohService = irohService
+        self.monitor = monitor
+        self.sessionManager = sessionManager
+        self._isControlExpanded = isControlExpanded
+        self.onSwitchSession = onSwitchSession
+        self.onAppsUpdated = onAppsUpdated
+        // Seed the morph so a session swap (which recreates this view) starts
+        // already expanded when the shared value is expanded — no flash.
+        self._expansion = State(initialValue: isControlExpanded.wrappedValue ? 1 : 0)
+    }
+
+    /// What to call this app: the page title learned from the web view (persisted
+    /// per server + app), else the server's name for it.
+    private var displayName: String {
+        AppNameStore.name(nodeId: key.nodeId, app: key.app) ?? key.app
+    }
 
     /// What the page is busy doing, if anything.
     private func busyText(session: WebAppSession) -> String? {
@@ -128,25 +156,13 @@ struct AppWebView: View {
     }
 
     var body: some View {
-        // The session owns proxy + web view; this view only presents it. A
-        // background session's page keeps running while the user is elsewhere.
-        @ViewBuilder
-        func presented() -> some View {
-            if let session = sessionManager.session(for: sessionKey) {
-                present(session)
-            } else {
-                // Blink before open() below creates the session.
-                ProgressView("Starting \(app.name)...")
-            }
+        // The router creates the session before pushing this view, and
+        // `AppHostView` only presents an existing session.
+        if let session = sessionManager.session(for: key) {
+            present(session)
+        } else {
+            Color.clear
         }
-
-        return presented()
-            .task {
-                // Open (or resume) this app's session — idempotent, and the
-                // LRU `touch()` on reappearances keeps ordering right.
-                _ = sessionManager.open(nodeId: nodeId, app: app.name)
-                sessionManager.activate(sessionKey)
-            }
     }
 
     /// The presented session: full-screen page + floating control.
@@ -163,11 +179,7 @@ struct AppWebView: View {
                     WebViewRepresentable(
                         url: proxyURL,
                         session: session,
-                        appName: app.name,
-                        onNameLearned: { name in
-                            learnedName = name
-                            onNameLearned(name)
-                        }
+                        appName: appName
                     )
 
                     if state.isLoading {
@@ -214,8 +226,7 @@ struct AppWebView: View {
         .task {
             // Mark this session active (strip, status, LRU ordering), even on
             // re-appearance — the proxy may already be running.
-            sessionManager.activate(sessionKey)
-            learnedName = AppNameStore.name(nodeId: nodeId, app: app.name)
+            sessionManager.activate(key)
             await connectThenStart(session: session)
             // Keep the direct/relayed indicator current while presented.
             await pollConnectionKind(session: session)
@@ -229,7 +240,7 @@ struct AppWebView: View {
                 Task { await startProxyIfConnected(session: session) }
             }
         }
-        .onChange(of: session.state.isExpanded) { _, expanded in
+        .onChange(of: isControlExpanded) { _, expanded in
             withAnimation(.snappy(duration: 0.3)) { expansion = expanded ? 1 : 0 }
         }
         // No teardown on disappear: background sessions keep their proxy and
@@ -290,7 +301,7 @@ struct AppWebView: View {
         while !Task.isCancelled {
             // Only the presented session drives the transport indicator;
             // background sessions don't need live sampling.
-            if sessionManager.isActive(sessionKey) {
+            if sessionManager.isActive(key) {
                 await irohService.refreshPathKind(nodeId: nodeId)
             }
             try? await Task.sleep(for: .seconds(2))
@@ -312,7 +323,7 @@ struct AppWebView: View {
     /// On foreground, make sure the serve connection is alive and retry a page
     /// that failed while the app was suspended.
     private func revalidate(session: WebAppSession) async {
-        guard sessionManager.isActive(sessionKey) else { return }
+        guard sessionManager.isActive(key) else { return }
         await irohService.validateConnection(nodeId: nodeId)
         let state = session.state
         if state.errorMessage != nil, let url = session.proxyURL {
@@ -327,19 +338,54 @@ struct AppWebView: View {
     private var controlCardWidth: CGFloat { 268 }
     private var controlHeaderHeight: CGFloat { 50 }
     private var controlButtonsHeight: CGFloat { 54 }
-    private var controlStripHeight: CGFloat { 45 }
-    /// Header + the 1pt `Divider` + (strip when present) + the button row.
+    /// The running-apps strip's height: one row of app icons, each in a square
+    /// tap target this tall. The strip's own frame and the card's height math
+    /// both use this value, so the content can never outgrow the space reserved
+    /// for it.
+    private var controlStripHeight: CGFloat { 44 }
+    /// Header + the 1pt `Divider` + (strip + divider when present) + the buttons.
     private func controlCardHeight(stripVisible: Bool) -> CGFloat {
         var height = controlHeaderHeight + 1 + controlButtonsHeight
         if stripVisible {
-            height += 1 + controlStripHeight
+            height += controlStripHeight + 1
         }
         return height
     }
 
+    /// The other running sessions, oldest first (what the strip offers).
+    private var otherRunningSessions: [WebAppSession] {
+        sessionManager.running.filter { $0.key != key }
+    }
+
     /// One or more *other* sessions are running: the strip shows in the card.
     private var runningAppsStripVisible: Bool {
-        sessionManager.running.contains { $0.key != sessionKey }
+        !otherRunningSessions.isEmpty
+    }
+
+    /// Whether the live connection can carry a request right now.
+    private var isConnected: Bool {
+        if case .connected = monitor.state { return true }
+        return false
+    }
+
+    /// Ask the server to rescan for local apps, then refresh the app lists and
+    /// the icon descriptors. Same server-side call as "Refresh Apps" in the
+    /// server detail. A failure is silent: the connection caption already
+    /// explains a dead link, and the page is unaffected either way.
+    private func refreshCatalog() async {
+        guard !isRefreshingCatalog else { return }
+        isRefreshingCatalog = true
+        defer { isRefreshingCatalog = false }
+
+        await irohService.validateConnection(nodeId: nodeId)
+        guard case .connected = monitor.state else { return }
+        do {
+            let apps = try await irohService.discoverCatalog(nodeId: nodeId)
+            AppIconStore.shared.register(nodeId: nodeId, apps: apps)
+            onAppsUpdated(nodeId, apps)
+        } catch {
+            print("[AppWebView] catalog refresh failed: \(error)")
+        }
     }
 
     /// How *this* server's live connection reaches us, or `nil` when unknown or
@@ -382,13 +428,13 @@ struct AppWebView: View {
             // Kept in the hierarchy while collapsed (at zero size/opacity) so the
             // card can morph out of, and back into, the circle.
             controlCard(circleCenter: base, in: size, progress: expansion, session: session)
-                .allowsHitTesting(session.state.isExpanded)
-                .accessibilityHidden(!session.state.isExpanded)
+                .allowsHitTesting(isControlExpanded)
+                .accessibilityHidden(!isControlExpanded)
         }
     }
 
     private func controlCircle(session: WebAppSession) -> some View {
-        Image(systemName: session.state.isExpanded ? "chevron.down" : "ellipsis")
+        Image(systemName: isControlExpanded ? "chevron.down" : "ellipsis")
             .font(.system(size: 18, weight: .bold))
             .frame(width: controlDiameter, height: controlDiameter)
             .contentShape(Circle())
@@ -407,7 +453,7 @@ struct AppWebView: View {
     }
 
     private func controlAccessibilityLabel(session: WebAppSession) -> String {
-        let action = session.state.isExpanded ? "Hide controls" : "Show controls"
+        let action = isControlExpanded ? "Hide controls" : "Show controls"
         return "\(action). \(connectionLabel.text)"
     }
 
@@ -424,7 +470,7 @@ struct AppWebView: View {
                     // circle doesn't jump back to its resting spot first.
                     withAnimation(.snappy(duration: 0.2)) {
                         dragTranslation = .zero
-                        session.state.isExpanded.toggle()
+                        isControlExpanded.toggle()
                     }
                     return
                 }
@@ -446,7 +492,7 @@ struct AppWebView: View {
                 withAnimation(.snappy(duration: 0.25)) {
                     dragTranslation = .zero
                     placement = snapped
-                    session.state.isExpanded = false
+                    isControlExpanded = false
                 }
                 FloatingControlStore.save(snapped)
             }
@@ -479,7 +525,7 @@ struct AppWebView: View {
                         .font(.subheadline.weight(.semibold))
                         .lineLimit(1)
                         .truncationMode(.middle)
-                    Text("· \(app.port)")
+                    Text("· \(port)")
                         .font(.subheadline.weight(.medium))
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
@@ -496,14 +542,16 @@ struct AppWebView: View {
                 Divider()
             }
 
-            HStack(spacing: 12) {
+            HStack(spacing: 8) {
+                refreshButton
+
                 controlButton(
                     systemName: "chevron.backward",
                     label: "Back",
                     enabled: state.canGoBack
                 ) {
                     state.goBack()
-                    collapse(session: session)
+                    collapse()
                 }
 
                 controlButton(
@@ -512,7 +560,7 @@ struct AppWebView: View {
                     enabled: state.canGoForward
                 ) {
                     state.goForward()
-                    collapse(session: session)
+                    collapse()
                 }
 
                 shareButton(session: session)
@@ -539,42 +587,65 @@ struct AppWebView: View {
         .position(center)
     }
 
-    /// The running-apps strip: tap a row to swap the presented session in
-    /// place (both stay warm). Hidden with fewer than two running apps.
-    private var runningAppsStrip: some View {
-        let others = sessionManager.running.filter { $0.key != sessionKey }
-        return Group {
-            if others.count >= 1 {
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 10) {
-                        ForEach(others, id: \.key) { other in
-                            Button {
-                                // Tell the router to present this session's
-                                // app; the current one stays warm.
-                                onSwitchSession(other.key)
-                            } label: {
-                                VStack(spacing: 3) {
-                                    Image(systemName: "globe")
-                                        .font(.system(size: 15, weight: .semibold))
-                                        .frame(width: 30, height: 30)
-                                        .glassSurface(Circle())
-                                    Text(other.key.app)
-                                        .font(.caption2)
-                                        .lineLimit(1)
-                                        .truncationMode(.tail)
-                                }
-                                .padding(.horizontal, 4)
-                            }
-                            .buttonStyle(.plain)
-                            .frame(width: 52)
-                            .accessibilityLabel("Switch to \(other.key.app)")
-                        }
-                    }
-                    .padding(.horizontal, 10)
-                    .frame(maxWidth: .infinity)
+    /// Reload the server's app catalog (and icons) from inside the web view.
+    /// Left in the button row rather than the strip so it is available even
+    /// with a single app running; the card stays open so the spinner shows.
+    private var refreshButton: some View {
+        Button {
+            Task { await refreshCatalog() }
+        } label: {
+            ZStack {
+                if isRefreshingCatalog {
+                    ProgressView()
+                } else {
+                    Image(systemName: "arrow.clockwise")
+                        .font(.system(size: 17, weight: .semibold))
                 }
-                .frame(height: 44)
             }
+            .frame(width: 38, height: 38)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(!isConnected || isRefreshingCatalog)
+        .opacity(isConnected ? 1 : 0.35)
+        .accessibilityLabel("Refresh apps")
+    }
+
+    /// The running-apps strip: one icon per other running app (tap to swap the
+    /// presented app in place; the current one stays warm). Icons only — the app
+    /// name lives in the card header. Hidden when there is nothing else to
+    /// switch to. Its height is `controlStripHeight`, which the card reserves
+    /// exactly.
+    @ViewBuilder
+    private var runningAppsStrip: some View {
+        if !otherRunningSessions.isEmpty {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 6) {
+                    ForEach(otherRunningSessions, id: \.key) { other in
+                        Button {
+                            // The router swaps the presented session; this one
+                            // stays warm.
+                            onSwitchSession(other.key)
+                        } label: {
+                            AppIconView(
+                                nodeId: other.key.nodeId,
+                                app: other.key.app,
+                                service: irohService,
+                                size: 28
+                            )
+                            .frame(width: controlStripHeight, height: controlStripHeight)
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel(
+                            "Switch to \(AppNameStore.name(nodeId: other.key.nodeId, app: other.key.app) ?? other.key.app)"
+                        )
+                    }
+                }
+                .padding(.horizontal, 10)
+                .frame(maxWidth: .infinity)
+            }
+            .frame(height: controlStripHeight)
         }
     }
 
@@ -601,8 +672,8 @@ struct AppWebView: View {
         return CGPoint(x: x, y: y)
     }
 
-    private func collapse(session: WebAppSession) {
-        withAnimation(.snappy(duration: 0.2)) { session.state.isExpanded = false }
+    private func collapse() {
+        withAnimation(.snappy(duration: 0.2)) { isControlExpanded = false }
     }
 
     /// A circular icon button used inside the card.
@@ -626,7 +697,7 @@ struct AppWebView: View {
 
     private func shareButton(session: WebAppSession) -> some View {
         Button {
-            collapse(session: session)
+            collapse()
             Task { await prepareShare(session: session) }
         } label: {
             ZStack {
@@ -658,7 +729,7 @@ struct AppWebView: View {
         do {
             switch WebShare.contentKind(mimeType: state.currentMimeType) {
             case .webPage:
-                let link = WebShare.raemoteURL(nodeId: nodeId, appName: app.name, path: url.path)
+                let link = WebShare.raemoteURL(nodeId: nodeId, appName: appName, path: url.path)
                 let pdfURL = try? await pdfSnapshotURL(from: webView)
                 let source = WebPageActivityItemSource(link: link) { pdfURL }
                 state.shareRequest = ShareRequest(items: [source])
@@ -669,7 +740,7 @@ struct AppWebView: View {
                 let (temp, response) = try await URLSession.shared.download(from: url)
                 let filename = WebShare.fileFilename(
                     url: url,
-                    appName: app.name,
+                    appName: appName,
                     mimeType: response.mimeType
                 )
                 let dest = try WebShare.placeTemporaryFile(at: temp, filename: filename)
@@ -686,7 +757,7 @@ struct AppWebView: View {
                 continuation.resume(with: result)
             }
         }
-        let name = WebShare.pageFilename(title: webView.title, appName: app.name)
+        let name = WebShare.pageFilename(title: webView.title, appName: appName)
         return try WebShare.writeTemporaryFile(data, filename: name)
     }
 }
@@ -695,7 +766,6 @@ struct WebViewRepresentable: UIViewRepresentable {
     let url: URL
     let session: WebAppSession
     let appName: String
-    var onNameLearned: (String) -> Void = { _ in }
 
     func makeCoordinator() -> Coordinator {
         Coordinator(self)
@@ -812,13 +882,12 @@ struct WebViewRepresentable: UIViewRepresentable {
                     guard let self, let rawTitle = webView.title else { return }
                     let parent = self.parent
                     guard !parent.session.capturedTitle else { return }
-                    guard let name = AppNameStore.remember(
+                    guard AppNameStore.remember(
                         rawTitle,
                         nodeId: parent.session.key.nodeId,
                         app: parent.appName
-                    ) else { return }
+                    ) != nil else { return }
                     parent.session.capturedTitle = true
-                    parent.onNameLearned(name)
                 }
             }
         }

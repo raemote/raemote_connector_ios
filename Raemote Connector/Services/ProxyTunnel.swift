@@ -160,6 +160,37 @@ nonisolated enum ProxyHTTP {
     }
 }
 
+/// Shared flag between a tunnel's pumps and its response watchdog: it records
+/// whether any response byte ever reached the client, and whether the attempt
+/// timed out before that happened.
+private nonisolated final class ResponseWatch: @unchecked Sendable {
+    private let lock = NSLock()
+    private var sawData = false
+    private var timedOut = false
+
+    func markData() {
+        lock.lock()
+        sawData = true
+        lock.unlock()
+    }
+
+    /// Watchdog side: report a timeout only when nothing ever came back, and
+    /// record it *before* the caller closes the connection (so the attempt
+    /// sees `didTimeOut`).
+    func timedOutBeforeAnyData() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        timedOut = !sawData
+        return timedOut
+    }
+
+    var didTimeOut: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return timedOut
+    }
+}
+
 /// Streams one loopback HTTP connection to a serve stream and back.
 ///
 /// Unlike a request/response relay, this pumps bytes **both** ways, so
@@ -177,12 +208,24 @@ nonisolated final class ProxyTunnel: @unchecked Sendable {
     private static let maxHeadBytes = 64 * 1024
     /// Largest error body we'll buffer to swap for an HTML page.
     private static let maxErrorBytes = 64 * 1024
+    /// How long to wait for the first response byte before deciding the
+    /// connection is dead (e.g. the server restarted and the cached connection
+    /// is stale). Kept well above a normal app's first-byte time.
+    private static let responseTimeout: Duration = .seconds(15)
 
     init(connection: NWConnection, appName: String, service: IrohService, nodeId: String) {
         self.connection = connection
         self.appName = appName
         self.service = service
         self.nodeId = nodeId
+    }
+
+    /// Whether the response produced any bytes.
+    private enum Outcome {
+        /// The response was delivered (or the client went away first).
+        case finished
+        /// Nothing came back within `responseTimeout`.
+        case noResponse
     }
 
     func start() async {
@@ -193,45 +236,95 @@ nonisolated final class ProxyTunnel: @unchecked Sendable {
             return
         }
 
+        // A stale connection accepts the request but never answers. That is
+        // safe to replay only when the request had no body (a GET/HEAD):
+        // retrying a POST could apply it twice, so those get an error instead.
+        let replayable = rewritten.framing == .none && !rewritten.isUpgrade
+        let attempts = replayable ? 2 : 1
+
+        for attempt in 0..<attempts {
+            if attempt > 0 {
+                print("[ProxyTunnel] retrying \(appName) on a fresh connection")
+                await service.invalidateConnection(nodeId: nodeId)
+            }
+            switch await run(rewritten, rest) {
+            case .finished:
+                return
+            case .noResponse where attempt + 1 < attempts:
+                continue
+            case .noResponse:
+                await sendError(
+                    status: 504,
+                    reason: "Gateway Timeout",
+                    message: "The app didn't respond.",
+                    hint: "It may have just restarted — reload to try again."
+                )
+                return
+            }
+        }
+    }
+
+    /// One tunnel attempt: open a stream, replay the request, pump the response.
+    private func run(_ rewritten: RewrittenHead, _ rest: Data) async -> Outcome {
         let stream: IrohService.RawStream
         do {
             stream = try await service.openStream(nodeId: nodeId)
         } catch {
+            // `openStream` already reconnects; report rather than retry.
             await sendError(
                 status: 502,
                 reason: "Bad Gateway",
                 message: "Couldn't reach the app.",
                 hint: "\(error)"
             )
-            return
+            return .finished
         }
 
         do {
             try await stream.send.writeAll(buf: rewritten.head)
         } catch {
             connection.cancel()
-            return
+            await service.streamFinished(nodeId: nodeId)
+            return .finished
         }
+
+        // Watchdog: if the server never answers, close the connection so the
+        // pending stream read errors out (a hung read cannot otherwise be
+        // interrupted through the FFI), letting the attempt finish and retry.
+        let watch = ResponseWatch()
+        let watchdog = Task { [service, nodeId, connection] in
+            try? await Task.sleep(for: Self.responseTimeout)
+            if watch.timedOutBeforeAnyData() {
+                print("[ProxyTunnel] no response from \(appName) in \(Self.responseTimeout); treating the connection as dead")
+                // An upgrade can't be replayed and its `pumpToServer` is blocked
+                // on the client socket, so close it to let the attempt finish.
+                if rewritten.isUpgrade { connection.cancel() }
+                await service.invalidateConnection(nodeId: nodeId)
+            }
+        }
+        defer { watchdog.cancel() }
 
         if rewritten.isUpgrade {
             // Tunnel both directions until either side closes.
             await withTaskGroup(of: Void.self) { group in
                 group.addTask { await self.pumpToServer(send: stream.send, initial: rest) }
-                group.addTask { await self.pumpToClient(recv: stream.recv) }
+                group.addTask { await self.pumpToClient(recv: stream.recv, watch: watch) }
             }
-            return
+        } else {
+            // Upload the (possibly streamed) request body, then finish the send half.
+            do {
+                try await uploadBody(rest, framing: rewritten.framing, send: stream.send)
+                try await stream.send.finish()
+            } catch {
+                connection.cancel()
+                await service.streamFinished(nodeId: nodeId)
+                return .finished
+            }
+            _ = await pumpToClient(recv: stream.recv, watch: watch)
         }
 
-        // Upload the (possibly streamed) request body, then finish the send half.
-        do {
-            try await uploadBody(rest, framing: rewritten.framing, send: stream.send)
-            try await stream.send.finish()
-        } catch {
-            connection.cancel()
-            return
-        }
-
-        await pumpToClient(recv: stream.recv)
+        await service.streamFinished(nodeId: nodeId)
+        return watch.didTimeOut ? .noResponse : .finished
     }
 
     // MARK: - Reading the request
@@ -324,7 +417,7 @@ nonisolated final class ProxyTunnel: @unchecked Sendable {
     }
 
     /// iroh → client until the stream ends.
-    private func pumpToClient(recv: RecvStream) async {
+    private func pumpToClient(recv: RecvStream, watch: ResponseWatch) async {
         // Peek the response head so our small JSON errors can be shown as HTML.
         var buffer = Data()
         while ProxyHTTP.headEnd(in: buffer) == nil {
@@ -336,6 +429,7 @@ nonisolated final class ProxyTunnel: @unchecked Sendable {
             }
             if chunk.isEmpty { break }
             buffer.append(chunk)
+            watch.markData()
             if buffer.count > Self.maxErrorBytes { break }
         }
 

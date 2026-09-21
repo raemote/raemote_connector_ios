@@ -79,4 +79,52 @@ struct IrohServiceTests {
         #expect(WebAppSessionKey(nodeId: "server-a", app: "jellyfin")
             != WebAppSessionKey(nodeId: "server-a", app: "pihole"))
     }
+
+    // MARK: - Connection freshness
+
+    @Test func aRecentlyUsedConnectionIsTrusted() {
+        let now = Date()
+        #expect(
+            ConnectionFreshness.isTrustworthy(
+                lastUsed: now.addingTimeInterval(-1),
+                hasOpenStream: false,
+                now: now
+            )
+        )
+    }
+
+    @Test func aConnectionIdlePastTheWindowIsNotTrusted() {
+        // The server may have restarted while the app was away; the old
+        // connection looks alive until the QUIC idle timeout, so reusing it
+        // would hang. Reconnecting instead is the fix.
+        let now = Date()
+        #expect(
+            !ConnectionFreshness.isTrustworthy(
+                lastUsed: now.addingTimeInterval(-(ConnectionFreshness.staleAfter + 1)),
+                hasOpenStream: false,
+                now: now
+            )
+        )
+        // The boundary belongs to "stale" (strictly less than is fresh).
+        #expect(
+            !ConnectionFreshness.isTrustworthy(
+                lastUsed: now.addingTimeInterval(-ConnectionFreshness.staleAfter),
+                hasOpenStream: false,
+                now: now
+            )
+        )
+    }
+
+    @Test func anOpenStreamKeepsAConnectionTrusted() {
+        // A long-lived tunnel proves the connection is alive, so an idle
+        // WebSocket must survive the staleness window.
+        let now = Date()
+        #expect(
+            ConnectionFreshness.isTrustworthy(
+                lastUsed: now.addingTimeInterval(-3600),
+                hasOpenStream: true,
+                now: now
+            )
+        )
+    }
 }
