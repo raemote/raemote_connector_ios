@@ -40,30 +40,44 @@ struct WebAppSessionManagerTests {
         #expect(!manager.close(nodeId: "n", app: "app1"))
     }
 
-    @Test func lruEvictionKeepsTheActiveSession() throws {
+    @Test func evictsTheLeastRecentlyUsedNotTheOldestOpened() throws {
         let manager = makeManager()
         var keys: [WebAppSessionKey] = []
         for i in 0..<WebAppSessionManager.maxSessions {
-            let key = try #require(WebAppSessionKey(nodeId: "node", app: "app-\(i)"))
+            let key = WebAppSessionKey(nodeId: "node", app: "app-\(i)")
             manager.open(nodeId: key.nodeId, app: key.app)
+            // Deterministic LRU ordering: app-0 was used least recently.
+            manager.session(for: key)?.lastActivated = Date(timeIntervalSince1970: TimeInterval(i + 1))
             keys.append(key)
         }
         #expect(manager.runningCount == WebAppSessionManager.maxSessions)
 
-        // Opening one more (nothing activated yet): the oldest is evicted.
+        // Use the *first-opened* app again. It is now the most recently used,
+        // so the next open must evict app-1 — not app-0, which insertion order
+        // (the old behaviour) would have picked.
+        manager.session(for: keys[0])?.lastActivated = Date(timeIntervalSince1970: 1000)
+
         let extra = manager.open(nodeId: "node", app: "app-extra")
         #expect(manager.runningCount == WebAppSessionManager.maxSessions)
-        #expect(!manager.isRunning(keys[0]), "oldest session is evicted")
-        #expect(manager.isRunning(keys[WebAppSessionManager.maxSessions - 1]))
+        #expect(manager.isRunning(keys[0]), "recently used session is kept")
+        #expect(!manager.isRunning(keys[1]), "least recently used session is evicted")
         #expect(manager.isRunning(extra.key))
+    }
 
-        // The active session is never evicted.
-        let anchored = keys[WebAppSessionManager.maxSessions - 1]
+    @Test func evictionNeverTakesTheActiveSession() throws {
+        let manager = makeManager()
+        let anchored = WebAppSessionKey(nodeId: "node", app: "anchored")
+        manager.open(nodeId: anchored.nodeId, app: anchored.app)
         manager.activate(anchored)
+        // Older than everything else, yet still not a candidate: the presented
+        // session is the one that must not be torn down.
+        manager.session(for: anchored)?.lastActivated = Date(timeIntervalSince1970: 0)
+
         for i in 0..<WebAppSessionManager.maxSessions {
             _ = manager.open(nodeId: "node2", app: "next-\(i)")
             #expect(manager.isRunning(anchored), "active session survives eviction")
         }
+        #expect(manager.runningCount == WebAppSessionManager.maxSessions)
     }
 
     @Test func closeClearsActiveKeyWhenItIsTheClosedOne() {

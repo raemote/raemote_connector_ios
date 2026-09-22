@@ -63,18 +63,22 @@ struct RecentAppStoreTests {
         #expect(store.entries.map(\.nodeId) == ["server-b"])
     }
 
-    @Test func capsTheHistoryAtTheOldestEnd() {
+    /// The history is deliberately unbounded: the row scrolls, so a long
+    /// history costs a longer scroll and nothing else. Memory is what is
+    /// capped — `WebAppSessionManager` keeps only the five most recently used
+    /// apps live — and an app evicted from memory keeps its tile here.
+    @Test func keepsEveryEntryNoMatterHowLongTheHistory() {
         let (store, _, _) = freshStore()
-        for i in 0..<(RecentAppStore.maxEntries + 5) {
+        let count = 100
+        for i in 0..<count {
             store.record(
                 key("server-a", "app-\(i)"),
                 at: Date(timeIntervalSince1970: TimeInterval(i))
             )
         }
-        #expect(store.entries.count == RecentAppStore.maxEntries)
-        // The newest survived; the first five were dropped.
-        #expect(store.entries.first?.app == "app-\(RecentAppStore.maxEntries + 4)")
-        #expect(!store.entries.contains { $0.app == "app-0" })
+        #expect(store.entries.count == count)
+        #expect(store.entries.first?.app == "app-\(count - 1)")
+        #expect(store.entries.last?.app == "app-0")
     }
 
     @Test func removeAllDropsOnlyThatServer() {

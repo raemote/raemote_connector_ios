@@ -12,6 +12,12 @@ import Observation
 /// Entries are keyed by **server node id + app name** (the NodeId-isolation
 /// rule): two servers running an identically-named app are two distinct
 /// recents, never one.
+///
+/// The history is deliberately **unbounded**: the row scrolls, so a long
+/// history costs a longer scroll and nothing else. What is capped is *memory*,
+/// not memory-of-use — `WebAppSessionManager` keeps only the five most
+/// recently used apps live, so an evicted app keeps its tile here and is one
+/// tap from being warm again. Manual removal is always available.
 @MainActor
 @Observable
 final class RecentAppStore {
@@ -30,8 +36,6 @@ final class RecentAppStore {
     /// Most recently used first.
     private(set) var entries: [Entry] = []
 
-    /// Older entries fall off the far end; the row scrolls, but only so far.
-    static let maxEntries = 24
     private static let storageKey = "recentApps"
 
     @ObservationIgnored private let defaults: UserDefaults
@@ -45,9 +49,6 @@ final class RecentAppStore {
     func record(_ key: WebAppSessionKey, at date: Date = .now) {
         entries.removeAll { $0.key == key }
         entries.insert(Entry(nodeId: key.nodeId, app: key.app, lastUsed: date), at: 0)
-        if entries.count > Self.maxEntries {
-            entries.removeSubrange(Self.maxEntries...)
-        }
         save()
     }
 

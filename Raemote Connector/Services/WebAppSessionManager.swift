@@ -60,8 +60,11 @@ final class WebAppSession {
 /// - One session per `(nodeId, app)`: the same app on two servers is two
 ///   sessions (NodeId-isolated — this is the resource-isolation rule).
 /// - Sessions are capped: launching beyond the cap evicts the least-recently
-///   activated one (proxy stopped, web view discarded; site data survives in
-///   the persistent data store).
+///   *used* one (proxy stopped, web view discarded; site data survives in the
+///   persistent data store). Usage — not insertion order — decides, so the five
+///   apps you touched most recently are the five that stay warm. Eviction is
+///   only ever about memory: the app's "Recent" tile is untouched
+///   (`RecentAppStore`), so it stays one tap away.
 /// - Sessions live for the app's process lifetime; no cross-relaunch state.
 @MainActor
 @Observable
@@ -214,20 +217,25 @@ final class WebAppSessionManager {
         for key in Array(sessions.keys) { close(key) }
     }
 
-    /// Evict oldest sessions down to one free slot so a new open fits; the
-    /// active session is never evicted.
+    /// Evict the least-recently-used sessions down to one free slot so a new
+    /// open fits; the active session is never evicted.
     private func evictIfNeeded() {
-        while sessions.count >= Self.maxSessions, let oldest = firstEvictable() {
-            print("[Sessions] LRU evicting \(oldest.id)")
-            close(oldest)
+        while sessions.count >= Self.maxSessions, let lru = leastRecentlyUsed() {
+            print("[Sessions] LRU evicting \(lru.id)")
+            close(lru)
         }
     }
 
-    private func firstEvictable() -> WebAppSessionKey? {
-        for key in order where key != activeKey {
-            return key
-        }
-        return nil
+    /// The least recently *activated* session that may be evicted, or nil when
+    /// only the active session is left.
+    ///
+    /// Ordered by `lastActivated`, not by insertion: an app opened long ago but
+    /// used a moment ago is exactly the one to keep warm — that is what "the
+    /// five most recently used stay in memory" means. A session opened but not
+    /// yet activated (never touched) sorts first, which is also right.
+    private func leastRecentlyUsed() -> WebAppSessionKey? {
+        let candidates = sessions.filter { $0.key != activeKey }
+        return candidates.min { $0.value.lastActivated < $1.value.lastActivated }?.key
     }
 
     // MARK: - Order bookkeeping (insertion-ordered keys, oldest first)
