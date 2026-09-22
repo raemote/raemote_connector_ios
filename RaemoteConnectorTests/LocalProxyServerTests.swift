@@ -111,4 +111,27 @@ struct ProxyHTTPTests {
         #expect(text.contains("&lt;the app&gt;"))
         #expect(text.contains("a &amp; b"))
     }
+
+    /// Our error pages are marked in the response, so the web view can tell
+    /// them apart from the app's own pages without matching title text.
+    @Test func errorPageCarriesTheMarkerHeader() {
+        let page = ProxyHTTP.errorPage(
+            status: 504,
+            reason: "Gateway Timeout",
+            message: "The app didn't respond.",
+            hint: nil
+        )
+        let text = String(decoding: page, as: UTF8.self)
+        let head = text.components(separatedBy: "\r\n\r\n").first ?? ""
+        #expect(head.contains("\(ProxyHTTP.errorMarkerHeader): 1"))
+
+        // The JSON→HTML swap routes through the same builder, so it is marked
+        // too (it uses the server's own error message as the title).
+        let jsonBody = Data(#"{"error":"unknown app \"x\"","hint":"refresh"}"#.utf8)
+        let headBytes = Data("HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\n\r\n".utf8)
+        let swapped = ProxyHTTP.errorPageInsteadOfJSON(head: headBytes, body: jsonBody)
+        let swappedHead = String(decoding: swapped ?? Data(), as: UTF8.self)
+            .components(separatedBy: "\r\n\r\n").first ?? ""
+        #expect(swappedHead.contains("\(ProxyHTTP.errorMarkerHeader): 1"))
+    }
 }

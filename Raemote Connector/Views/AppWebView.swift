@@ -33,6 +33,11 @@ final class WebViewState {
     /// Main-frame URL and MIME type, mirrored from the navigation delegate.
     var currentURL: URL?
     var currentMimeType: String?
+    /// The current main-frame document is one of our own generated error pages
+    /// (marked with `ProxyHTTP.errorMarkerHeader`), not the app's page — so its
+    /// title must never be taken as the app's name. Lives on the session's page
+    /// state so a re-attached web view (a fresh coordinator) still knows.
+    var isRaemoteErrorPage = false
 
     @ObservationIgnored weak var webView: WKWebView?
 
@@ -235,7 +240,7 @@ struct AppWebView: View {
             guard phase == .active else { return }
             Task { await revalidate(session: session) }
         }
-        .onChange(of: monitor.state) { _, newState in
+        .onChange(of: connectionState) { _, newState in
             if case .connected = newState, session.proxyURL == nil {
                 Task { await startProxyIfConnected(session: session) }
             }
@@ -266,7 +271,7 @@ struct AppWebView: View {
                 .controlSize(.large)
             Text("Connecting to server…")
                 .font(.headline)
-            if case .disconnected(let reason) = monitor.state,
+            if case .disconnected(let reason) = connectionState,
                let reason, !reason.isEmpty {
                 Text(reason)
                     .font(.caption)
@@ -287,7 +292,7 @@ struct AppWebView: View {
         }
         while !Task.isCancelled {
             await irohService.validateConnection(nodeId: nodeId)
-            if case .connected = monitor.state { break }
+            if case .connected = connectionState { break }
             try? await Task.sleep(for: .seconds(2))
         }
         guard !Task.isCancelled else { return }
@@ -310,7 +315,7 @@ struct AppWebView: View {
 
     private func startProxyIfConnected(session: WebAppSession) async {
         guard session.proxyURL == nil else { return }
-        guard case .connected = monitor.state else { return }
+        guard case .connected = connectionState else { return }
         do {
             // A stored launch path (e.g. `/?token=…`) applies on first start;
             // later activations resume where the page already is.
@@ -362,23 +367,41 @@ struct AppWebView: View {
         !otherRunningSessions.isEmpty
     }
 
-    /// Whether the live connection can carry a request right now.
-    private var isConnected: Bool {
-        if case .connected = monitor.state { return true }
-        return false
+    /// This session's server connection state. Keyed by node id, so the web
+    /// view never acts on (or shows) another server's connection state.
+    private var connectionState: IrohConnectionState {
+        monitor.state(for: nodeId)
     }
 
-    /// Ask the server to rescan for local apps, then refresh the app lists and
-    /// the icon descriptors. Same server-side call as "Refresh Apps" in the
-    /// server detail. A failure is silent: the connection caption already
-    /// explains a dead link, and the page is unaffected either way.
+    /// Whether the live connection can carry a request right now.
+    private var isConnected: Bool {
+        connectionState == .connected
+    }
+
+    /// Refresh the presented app: reload the page from the app itself, then ask
+    /// the server to rescan its local apps (so the list and icons are current
+    /// too).
+    ///
+    /// Reloading is the point. Once the app's own server is stopped or
+    /// restarted, the rendered page is stale — refresh has to fetch it again.
+    /// `reloadFromOrigin` bypasses the web cache, otherwise WebKit could serve
+    /// the old page even though its server is gone.
+    private func refresh() async {
+        sessionManager.session(for: key)?.state.webView?.reloadFromOrigin()
+        await refreshCatalog()
+    }
+
+    /// Rescan the server's local apps and update the app lists and icon
+    /// descriptors. Same server-side call as "Refresh Apps" in the server
+    /// detail. A failure is silent: the connection caption already explains a
+    /// dead link, and the page is unaffected either way.
     private func refreshCatalog() async {
         guard !isRefreshingCatalog else { return }
         isRefreshingCatalog = true
         defer { isRefreshingCatalog = false }
 
         await irohService.validateConnection(nodeId: nodeId)
-        guard case .connected = monitor.state else { return }
+        guard case .connected = connectionState else { return }
         do {
             let apps = try await irohService.discoverCatalog(nodeId: nodeId)
             AppIconStore.shared.register(nodeId: nodeId, apps: apps)
@@ -587,12 +610,12 @@ struct AppWebView: View {
         .position(center)
     }
 
-    /// Reload the server's app catalog (and icons) from inside the web view.
-    /// Left in the button row rather than the strip so it is available even
-    /// with a single app running; the card stays open so the spinner shows.
+    /// Reload the presented app from its server (and rescan the server's app
+    /// list). Left in the button row rather than the strip so it is available
+    /// even with a single app running; the card stays open so the spinner shows.
     private var refreshButton: some View {
         Button {
-            Task { await refreshCatalog() }
+            Task { await refresh() }
         } label: {
             ZStack {
                 if isRefreshingCatalog {
@@ -608,7 +631,7 @@ struct AppWebView: View {
         .buttonStyle(.plain)
         .disabled(!isConnected || isRefreshingCatalog)
         .opacity(isConnected ? 1 : 0.35)
-        .accessibilityLabel("Refresh apps")
+        .accessibilityLabel("Reload app")
     }
 
     /// The running-apps strip: one icon per other running app (tap to swap the
@@ -877,11 +900,17 @@ struct WebViewRepresentable: UIViewRepresentable {
             // display name. Once per SESSION, not per representation: a fresh
             // coordinator on re-attach must not overwrite the recorded name
             // with a deeper page's title.
+            //
+            // A page *we* generated (an error page such as "Couldn't reach the
+            // app.") is not the app talking: its title must never become the
+            // app's name, so `capturedTitle` is left unset and a later real
+            // page can still name it.
             titleObservation = webView.observe(\.title, options: [.initial, .new]) { [weak self] webView, _ in
                 MainActor.assumeIsolated {
                     guard let self, let rawTitle = webView.title else { return }
                     let parent = self.parent
                     guard !parent.session.capturedTitle else { return }
+                    guard !parent.session.state.isRaemoteErrorPage else { return }
                     guard AppNameStore.remember(
                         rawTitle,
                         nodeId: parent.session.key.nodeId,
@@ -1039,6 +1068,15 @@ struct WebViewRepresentable: UIViewRepresentable {
             if navigationResponse.isForMainFrame {
                 let mime = navigationResponse.response.mimeType
                 let url = navigationResponse.response.url
+                // Our own error pages are marked, so the title observer can
+                // tell them apart from the app's own pages. A response property
+                // (not the status code or title text): our pages reuse ordinary
+                // statuses like 502, and the app may serve those too. Set
+                // synchronously — the delegate runs on the main thread and the
+                // title observer must see it before the document's title lands.
+                parent.session.state.isRaemoteErrorPage =
+                    (navigationResponse.response as? HTTPURLResponse)?
+                        .value(forHTTPHeaderField: ProxyHTTP.errorMarkerHeader) != nil
                 DispatchQueue.main.async {
                     self.parent.session.state.currentMimeType = mime
                     if let url { self.parent.session.state.currentURL = url }

@@ -72,4 +72,34 @@ struct AppNameStoreTests {
         AppNameStore.remember("Second", nodeId: "server-a", app: "app", defaults: defaults)
         #expect(AppNameStore.name(nodeId: "server-a", app: "app", defaults: defaults) == "Second")
     }
+
+    /// A name stored by a build before the error-page marker (which could have
+    /// saved our own error headline) is dropped once, and the version is
+    /// recorded so it does not happen again.
+    @Test func migrationDropsNamesFromOlderBuilds() {
+        let defaults = freshDefaults()
+        // Simulate a v1 store holding the confusing value.
+        defaults.set(
+            ["server-a/app": "Couldn't reach the app."],
+            forKey: "appNamesByApp"
+        )
+        defaults.set(1, forKey: "appNamesSchemaVersion")
+
+        #expect(AppNameStore.name(nodeId: "server-a", app: "app", defaults: defaults) == nil)
+        #expect(defaults.integer(forKey: "appNamesSchemaVersion") == 2)
+
+        // It only happens once: a name learned afterwards survives a re-read.
+        AppNameStore.remember("Jellyfin", nodeId: "server-a", app: "app", defaults: defaults)
+        #expect(AppNameStore.name(nodeId: "server-a", app: "app", defaults: defaults) == "Jellyfin")
+        #expect(AppNameStore.name(nodeId: "server-a", app: "app", defaults: defaults) == "Jellyfin")
+    }
+
+    /// Read-time validation: a stored value that would be rejected today is
+    /// never surfaced, even if it predates the write-time guard.
+    @Test func aStoredValueThatIsUnusableIsNotSurfaced() {
+        let defaults = freshDefaults()
+        defaults.set(["server-a/app": "127.0.0.1:52001"], forKey: "appNamesByApp")
+        defaults.set(2, forKey: "appNamesSchemaVersion")
+        #expect(AppNameStore.name(nodeId: "server-a", app: "app", defaults: defaults) == nil)
+    }
 }

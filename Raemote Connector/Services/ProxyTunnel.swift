@@ -23,6 +23,12 @@ struct RewrittenHead: Equatable {
 /// Pure HTTP helpers for the tunnel. Kept UIKit/Network-free so they can be
 /// unit-tested.
 nonisolated enum ProxyHTTP {
+    /// Response header set on error pages **we** generate (as opposed to the
+    /// app's own responses). The web view checks it so it never learns an app
+    /// name from our error page's `<title>` ("Couldn't reach the app.") — a
+    /// response property, so no title text ever needs to be compared.
+    static let errorMarkerHeader = "X-Raemote-Error"
+
     /// Index just past the head's terminating CRLF CRLF, if present.
     static func headEnd(in data: Data) -> Int? {
         data.range(of: Data("\r\n\r\n".utf8))?.upperBound
@@ -133,6 +139,7 @@ nonisolated enum ProxyHTTP {
         let body = Data(html.utf8)
         let header = "HTTP/1.1 \(status) \(reason)\r\n"
             + "Content-Type: text/html; charset=utf-8\r\n"
+            + "\(errorMarkerHeader): 1\r\n"
             + "Content-Length: \(body.count)\r\n"
             + "Connection: close\r\n\r\n"
         var out = Data(header.utf8)

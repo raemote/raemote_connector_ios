@@ -1,7 +1,9 @@
 import SwiftUI
 
 /// An app's icon: the cached favicon when available, else a monogram (the
-/// app's initial on a stable tint).
+/// app's initial on a stable tint), drawn as a **circle** everywhere it
+/// appears (recent chips, the app list, the running-apps strip) so the app has
+/// one shape language.
 ///
 /// Loading is lazy — a row starts the fetch only when it appears, and
 /// `AppIconStore` de-duplicates concurrent loads of the same app. The icon's
@@ -15,8 +17,6 @@ struct AppIconView: View {
 
     @State private var image: UIImage?
 
-    private var cornerRadius: CGFloat { size * 0.24 }
-
     var body: some View {
         Group {
             if let image {
@@ -28,10 +28,9 @@ struct AppIconView: View {
             }
         }
         .frame(width: size, height: size)
-        .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+        .clipShape(Circle())
         .overlay {
-            RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                .strokeBorder(.separator, lineWidth: 0.5)
+            Circle().strokeBorder(.separator, lineWidth: 0.5)
         }
         .accessibilityHidden(true)
         .task(id: taskID) {

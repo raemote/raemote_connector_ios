@@ -49,10 +49,17 @@ struct ContentView: View {
     var body: some View {
         NavigationStack(path: $path) {
             List {
-                // Live running apps across all paired servers; tap to resume
-                // (warm), swipe to close the session (site data is kept).
-                if !sessionManager.running.isEmpty {
-                    runningSection
+                // Recently opened apps across every paired server, most recent
+                // first; a running one carries a green dot and the rest are kept
+                // so a stopped app is one tap away. Compact: a single row.
+                if !RecentAppStore.shared.entries.isEmpty {
+                    RecentAppsSection(
+                        entries: RecentAppStore.shared.entries,
+                        servers: servers,
+                        sessionManager: sessionManager,
+                        irohService: irohService,
+                        onOpen: { openApp($0) }
+                    )
                 }
                 if servers.isEmpty {
                     ContentUnavailableView(
@@ -345,73 +352,12 @@ struct ContentView: View {
         showPairingCancel = false
     }
 
-    /// The "Running" section in the server list: live sessions across every
-    /// paired server, tap to resume, swipe to close.
-    private var runningSection: some View {
-        let sessions = sessionManager.running
-        return Section("Running") {
-            ForEach(sessions, id: \.key) { session in
-                runningRow(session)
-            }
-            .onDelete { offsets in
-                closeRunningSessions(at: offsets)
-            }
-        }
-    }
-
-    private func closeRunningSessions(at offsets: IndexSet) {
-        let sessions = sessionManager.running
-        for offset in offsets where offset < sessions.count {
-            sessionManager.close(sessions[offset].key)
-        }
-    }
-
-    /// A running app row: icon + green dot + app name + server name; tap resumes
-    /// the warm session; long-press closes it.
-    private func runningRow(_ session: WebAppSession) -> some View {
-        let key = session.key
-        let appName = AppNameStore.name(nodeId: key.nodeId, app: key.app) ?? key.app
-        let server = servers.first { $0.nodeId == key.nodeId }
-        let serverName = server?.displayName ?? String(key.nodeId.prefix(12)) + "…"
-        return Button {
-            openApp(key)
-        } label: {
-            HStack(spacing: 10) {
-                AppIconView(nodeId: key.nodeId, app: key.app, service: irohService, size: 32)
-                VStack(alignment: .leading, spacing: 2) {
-                    HStack(spacing: 6) {
-                        Circle()
-                            .fill(.green)
-                            .frame(width: 8, height: 8)
-                            .accessibilityLabel("Running")
-                        Text(appName).font(.headline)
-                    }
-                    Text(serverName)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                Spacer(minLength: 0)
-                Image(systemName: "chevron.forward")
-                    .font(.footnote.weight(.semibold))
-                    .foregroundStyle(.tertiary)
-            }
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .contextMenu {
-            Button("Close App", role: .destructive) {
-                sessionManager.close(key)
-            }
-        }
-    }
-
     // MARK: - Presenting apps
 
     /// Open an app: ensure its session exists, make it the active one, and push
-    /// the single app host. Called from the server detail and the running list.
+    /// the single app host. Called from the server detail and the Recent row.
     private func openApp(_ key: WebAppSessionKey) {
-        _ = sessionManager.open(nodeId: key.nodeId, app: key.app)
-        sessionManager.activate(key)
+        present(key)
         path = Self.pathAfterOpen(from: path)
     }
 
@@ -419,9 +365,16 @@ struct ContentView: View {
     /// host is already the top of the stack (no navigation churn), otherwise
     /// collapse to the host so the back gesture returns to the main list.
     private func switchApp(_ key: WebAppSessionKey) {
+        present(key)
+        path = Self.pathAfterSwitch(from: path)
+    }
+
+    /// Make `key` the live, presented session (opening it if needed) and note it
+    /// as recent. The caller owns the navigation path.
+    private func present(_ key: WebAppSessionKey) {
+        RecentAppStore.shared.record(key)
         _ = sessionManager.open(nodeId: key.nodeId, app: key.app)
         sessionManager.activate(key)
-        path = Self.pathAfterSwitch(from: path)
     }
 
     /// Push exactly one app host, however deep the stack already is. Presenting
@@ -481,9 +434,10 @@ struct ContentView: View {
         servers.remove(atOffsets: offsets)
         saveServers()
         // Sessions of a deleted server would keep dialing a node the user no
-        // longer has a list entry for: close them too.
+        // longer has a list entry for: close them too, and forget its recents.
         for server in removed {
             sessionManager.closeRunningSessions(nodeId: server.nodeId)
+            RecentAppStore.shared.removeAll(nodeId: server.nodeId)
         }
     }
 
@@ -529,8 +483,7 @@ struct ContentView: View {
         var newPath: [Route] = [.server(server)]
         if let appName = link.appName,
            let app = server.apps.first(where: { $0.name == appName }) {
-            _ = sessionManager.open(nodeId: nodeId, app: app.name)
-            sessionManager.activate(WebAppSessionKey(nodeId: nodeId, app: app.name))
+            present(WebAppSessionKey(nodeId: nodeId, app: app.name))
             newPath.append(.app)
         }
         pendingDeepLink = nil

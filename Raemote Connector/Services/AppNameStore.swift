@@ -14,19 +14,42 @@ import Foundation
 /// cached name.
 enum AppNameStore {
     private static let storageKey = "appNamesByApp"
+    /// Schema version of the stored names. Bumped when an older build could
+    /// have stored a bad value; a store written before the current version is
+    /// dropped once (see `migrateIfNeeded`).
+    private static let versionKey = "appNamesSchemaVersion"
+    /// v1 → v2: builds before the error-page marker could store the title of our
+    /// own error page ("Couldn't reach the app.") as an app's name.
+    private static let currentVersion = 2
 
     private static func entryKey(nodeId: String, app: String) -> String {
         "\(nodeId)/\(app)"
     }
 
+    /// Drop names an older build may have stored incorrectly.
+    ///
+    /// Names are cheap to re-learn from the app's live title on its next visit,
+    /// so a one-time reset is cleaner than trying to guess which stored values
+    /// were bad (which would mean matching error-page text).
+    private static func migrateIfNeeded(_ defaults: UserDefaults) {
+        guard defaults.integer(forKey: versionKey) < currentVersion else { return }
+        defaults.removeObject(forKey: storageKey)
+        defaults.set(currentVersion, forKey: versionKey)
+    }
+
     /// The cached display name for an app, if any.
+    ///
+    /// Validated on read as well as on write, so a value that would be rejected
+    /// today is never surfaced.
     static func name(
         nodeId: String,
         app: String,
         defaults: UserDefaults = .standard
     ) -> String? {
+        migrateIfNeeded(defaults)
         let map = defaults.dictionary(forKey: storageKey) as? [String: String]
-        return map?[entryKey(nodeId: nodeId, app: app)]
+        guard let stored = map?[entryKey(nodeId: nodeId, app: app)] else { return nil }
+        return normalized(stored)
     }
 
     /// Every cached name for one server, keyed by app name.
@@ -34,6 +57,7 @@ enum AppNameStore {
         nodeId: String,
         defaults: UserDefaults = .standard
     ) -> [String: String] {
+        migrateIfNeeded(defaults)
         guard let map = defaults.dictionary(forKey: storageKey) as? [String: String] else {
             return [:]
         }
@@ -55,6 +79,7 @@ enum AppNameStore {
         app: String,
         defaults: UserDefaults = .standard
     ) -> String? {
+        migrateIfNeeded(defaults)
         guard let name = normalized(rawTitle) else { return nil }
         var map = (defaults.dictionary(forKey: storageKey) as? [String: String]) ?? [:]
         guard map[entryKey(nodeId: nodeId, app: app)] != name else { return name }

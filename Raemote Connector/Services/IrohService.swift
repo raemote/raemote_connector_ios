@@ -113,12 +113,33 @@ nonisolated struct IrohPathState: Equatable, Sendable {
 ///
 /// `IrohService` is an actor and can't be observed directly by SwiftUI, so it
 /// pushes state changes into this main-actor model.
+///
+/// State is **per server node** (the key is the node id). A single shared value
+/// would let a connected server's state be shown for a different, unreachable
+/// one — the NodeId-isolation rule: connection state belongs to the server it
+/// describes and is never leaked across servers.
 @MainActor
 @Observable
 final class IrohConnectionMonitor {
-    var state: IrohConnectionState = .unknown
+    private(set) var states: [String: IrohConnectionState] = [:]
     /// How the live serve connection reaches the server, when known.
     var path: IrohPathState?
+
+    /// The state recorded for `nodeId`, or `.unknown` when nothing is known.
+    func state(for nodeId: String) -> IrohConnectionState {
+        states[nodeId] ?? .unknown
+    }
+
+    /// Record `state` for `nodeId`.
+    func setState(_ state: IrohConnectionState, for nodeId: String) {
+        states[nodeId] = state
+    }
+
+    /// Forget every server's state (the endpoint was torn down).
+    func reset() {
+        states.removeAll()
+        path = nil
+    }
 }
 
 /// Whether a cached serve connection may be reused without reconnecting.
@@ -152,9 +173,10 @@ actor IrohService {
     private var connections: [String: ServeConnection] = [:]
     /// The drop-watcher task per live connection.
     private var watchers: [String: Task<Void, Never>] = [:]
-    /// The server the UI (detail/web view) is focused on: the monitor's state
-    /// and the default `httpRequest` target. Explicit `nodeId` parameters
-    /// always win over this.
+    /// The server the UI (detail/web view) is focused on: the default
+    /// `httpRequest` target and which server the sampled transport path
+    /// describes. Connection *state* is per node (`IrohConnectionMonitor`), so
+    /// focus does not select it. Explicit `nodeId` parameters always win.
     private var activeNodeId: String?
     /// In-flight connect tasks per node, so a burst of callers (web view +
     /// revalidation) shares one dial instead of racing several.
@@ -162,6 +184,13 @@ actor IrohService {
     /// Consecutive connect failures per node, used to decide when the endpoint
     /// (and with it its cached peer addresses) is worth rebuilding.
     private var connectFailures: [String: Int] = [:]
+    /// When the endpoint was last rebuilt, so a flaky network cannot make the
+    /// client tear down and re-create its endpoint in a loop.
+    private var lastEndpointRebuild: Date = .distantPast
+    /// Failed dials in a row before the endpoint is rebuilt.
+    private static let endpointRebuildFailureThreshold = 3
+    /// Minimum time between endpoint rebuilds.
+    private static let endpointRebuildCooldown: TimeInterval = 300
     /// Open stream count per node (a live tunnel keeps its connection fresh).
     private var openStreams: [String: Int] = [:]
 
@@ -240,7 +269,7 @@ actor IrohService {
 
     func bind(serverNodeId: String, token: String) async throws {
         await setFocus(serverNodeId)
-        await setState(.connecting)
+        await setState(.connecting, for: serverNodeId)
 
         do {
             let ep = try await ensureEndpoint()
@@ -277,16 +306,16 @@ actor IrohService {
             // 2. Open a persistent connection over the serve ALPN.
             print("[IrohService] connecting over serve ALPN...")
             _ = try await connectAndAdopt(nodeId: serverNodeId, timeout: nil)
-            await setState(.connected)
+            await setState(.connected, for: serverNodeId)
             // Tell the server how this device should be named (best effort).
             try? await setDeviceName(DeviceNameStore.name, nodeId: serverNodeId)
             print("[IrohService] bound and ready")
         } catch is CancellationError {
             // The user aborted pairing; don't leave a misleading reason behind.
-            await setState(.disconnected(nil))
+            await setState(.disconnected(nil), for: serverNodeId)
             throw CancellationError()
         } catch {
-            await setState(.disconnected(error.localizedDescription))
+            await setState(.disconnected(error.localizedDescription), for: serverNodeId)
             throw error
         }
     }
@@ -297,19 +326,19 @@ actor IrohService {
     /// can reconnect over `raemote/0` without the (short-lived) token.
     ///
     /// Running web apps keep their own connection per node; `focus` marks the
-    /// node the UI is presenting (monitor state + default HTTP target).
+    /// node the UI is presenting (default HTTP target + path sampling).
     func ensureConnection(nodeId: String, focus: Bool = true) async throws {
         if focus { await setFocus(nodeId) }
         if reliableConnection(nodeId) != nil {
-            if focus { await setState(.connected) }
+            if focus { await setState(.connected, for: nodeId) }
             return
         }
         _ = try await connectAndAdopt(nodeId: nodeId, timeout: Self.connectTimeout)
-        if focus { await setState(.connected) }
+        if focus { await setState(.connected, for: nodeId) }
     }
 
-    /// Marks which server the UI is presenting, so monitor state and the
-    /// parameterless `httpRequest` describe that server.
+    /// Marks which server the UI is presenting, so the parameterless
+    /// `httpRequest` and the sampled transport path describe that server.
     private func setFocus(_ nodeId: String) async {
         if activeNodeId != nodeId {
             activeNodeId = nodeId
@@ -350,10 +379,10 @@ actor IrohService {
                 nodeId: nodeId,
                 timeout: Self.validateTimeout
             )
-            await setState(.connected)
+            await setState(.connected, for: nodeId)
         } catch {
             retire(nodeId, matching: connections[nodeId]?.conn, reason: "validation failed")
-            await setState(.disconnected("connection unusable"))
+            await setState(.disconnected("connection unusable"), for: nodeId)
         }
     }
 
@@ -440,17 +469,25 @@ actor IrohService {
         }
     }
 
-    /// A dial failed. After a couple in a row, rebuild the endpoint so address
+    /// A dial failed. After several in a row, rebuild the endpoint so address
     /// discovery runs from scratch — that is what recovers when the *cached*
     /// address of a restarted server has gone stale. Only done when no live
-    /// connection exists: a working connection to another server proves
-    /// discovery is fine and must not be torn down.
+    /// connection exists (a working connection to another server proves
+    /// discovery is fine and must not be torn down) and at most once every few
+    /// minutes: on a flaky network, dials fail often, and rebuilding the
+    /// endpoint tears down relay/discovery state, so churning it would make
+    /// connectivity worse rather than better.
     private func noteConnectFailure(_ nodeId: String) async {
         let failures = (connectFailures[nodeId] ?? 0) + 1
         connectFailures[nodeId] = failures
         let hasLiveConnection = connections.values.contains { $0.conn.closeReason() == nil }
-        guard failures >= 2, !hasLiveConnection else { return }
+        let cooledDown = Date().timeIntervalSince(lastEndpointRebuild) >= Self.endpointRebuildCooldown
+        guard failures >= Self.endpointRebuildFailureThreshold,
+              !hasLiveConnection,
+              cooledDown
+        else { return }
         connectFailures[nodeId] = nil
+        lastEndpointRebuild = .now
         guard let stale = endpoint else { return }
         print("[IrohService] \(failures) failed dials to \(nodeId.prefix(8)); rebuilding the endpoint to redo discovery")
         endpoint = nil
@@ -531,18 +568,20 @@ actor IrohService {
         watchers[nodeId]?.cancel()
         watchers[nodeId] = nil
         print("[IrohService] serve connection dropped: \(nodeId.prefix(8)) \(reason)")
-        if activeNodeId == nodeId {
-            await setState(.disconnected(reason))
-        }
+        // Recorded for *this* node only, so a drop on one server never shows up
+        // as another server's state.
+        await setState(.disconnected(reason), for: nodeId)
     }
 
-    private func setState(_ state: IrohConnectionState) async {
+    private func setState(_ state: IrohConnectionState, for nodeId: String) async {
         let monitor = self.monitor
         await MainActor.run {
-            monitor.state = state
+            monitor.setState(state, for: nodeId)
             // A path only describes a live connection; drop it otherwise so the
             // UI never shows a stale "direct"/"relayed" for a dead connection.
-            if state != .connected { monitor.path = nil }
+            if state != .connected, monitor.path?.nodeId == nodeId {
+                monitor.path = nil
+            }
         }
     }
 
@@ -619,9 +658,7 @@ actor IrohService {
             markUsed(nodeId, conn)
             return data
         } catch {
-            if nodeId == activeNodeId {
-                await setState(.disconnected(error.localizedDescription))
-            }
+            await setState(.disconnected(error.localizedDescription), for: nodeId)
             throw error
         }
     }
@@ -830,7 +867,8 @@ actor IrohService {
         openStreams.removeAll()
         activeNodeId = nil
         endpoint = nil
-        await setState(.unknown)
+        let monitor = monitor
+        await MainActor.run { monitor.reset() }
     }
 }
 

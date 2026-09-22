@@ -180,7 +180,7 @@ struct ServerDetailView: View {
             // reality as soon as this screen appears.
             await revalidateOnAppear()
         }
-        .onChange(of: monitor.state) { _, newState in
+        .onChange(of: connectionState) { _, newState in
             // (Re)read the name once the connection is up, in case the first
             // fetch ran before it was ready.
             if case .connected = newState {
@@ -202,7 +202,7 @@ struct ServerDetailView: View {
 
     /// Read the name the server reports about itself.
     private func loadServerInfo() async {
-        guard case .connected = monitor.state else { return }
+        guard case .connected = connectionState else { return }
         guard let info = try? await irohService.fetchServerInfo(nodeId: server.nodeId), !info.name.isEmpty else { return }
         guard info.name != reportedName else { return }
         reportedName = info.name
@@ -220,7 +220,7 @@ struct ServerDetailView: View {
         defer { isCreatingInvitation = false }
 
         await irohService.validateConnection(nodeId: server.nodeId)
-        guard case .connected = monitor.state else {
+        guard case .connected = connectionState else {
             refreshError = "Not connected to the server. Try again once it reconnects."
             return
         }
@@ -241,7 +241,7 @@ struct ServerDetailView: View {
         defer { isRefreshing = false }
 
         await irohService.validateConnection(nodeId: server.nodeId)
-        guard case .connected = monitor.state else {
+        guard case .connected = connectionState else {
             refreshError = "Not connected to the server. Try again once it reconnects."
             return
         }
@@ -258,6 +258,14 @@ struct ServerDetailView: View {
 
     // MARK: - Connection status
 
+    /// This server's connection state. Keyed by node id, so a *different*
+    /// server's connection is never shown here (the NodeId-isolation rule) —
+    /// the bug this replaced: a connected server's state leaked into an
+    /// unreachable one's detail screen.
+    private var connectionState: IrohConnectionState {
+        monitor.state(for: server.nodeId)
+    }
+
     @ViewBuilder
     private var connectionRow: some View {
         HStack(spacing: 8) {
@@ -268,7 +276,7 @@ struct ServerDetailView: View {
             Spacer()
             Text(statusText)
                 .foregroundStyle(.secondary)
-            if case .disconnected = monitor.state {
+            if case .disconnected = connectionState {
                 Button {
                     Task { await irohService.validateConnection(nodeId: server.nodeId) }
                 } label: {
@@ -281,7 +289,7 @@ struct ServerDetailView: View {
             }
         }
 
-        if case .disconnected(let reason) = monitor.state,
+        if case .disconnected(let reason) = connectionState,
            let reason, !reason.isEmpty {
             Text(reason)
                 .font(.caption)
@@ -290,7 +298,7 @@ struct ServerDetailView: View {
     }
 
     private var statusColor: Color {
-        switch monitor.state {
+        switch connectionState {
         case .connected: return .green
         case .connecting: return .orange
         case .disconnected: return .red
@@ -299,7 +307,7 @@ struct ServerDetailView: View {
     }
 
     private var statusText: String {
-        switch monitor.state {
+        switch connectionState {
         case .connected: return "Connected"
         case .connecting: return "Connecting…"
         case .disconnected: return "Disconnected"
