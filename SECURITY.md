@@ -41,7 +41,9 @@ In scope (this app):
 - pairing and device identity: token handling, the Keychain entry, and what
   happens when a server is removed or a device revoked;
 - the in-app loopback proxy and the tunnel to the server: request rewriting,
-  and isolation between servers and between apps;
+  isolation between servers and between apps, and the loopback secret gate
+  (`ProxyAuth` — another app on the same phone must not reach the proxy or
+  ride the paired connection);
 - anything that lets one paired server — or one app served through it — read
   another's data, or reach something it should not;
 - deep links (`raemote://`), the QR scanner, and the share paths;

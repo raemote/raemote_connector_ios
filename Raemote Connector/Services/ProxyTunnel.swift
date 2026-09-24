@@ -236,9 +236,26 @@ nonisolated final class ProxyTunnel: @unchecked Sendable {
     }
 
     func start() async {
-        guard let (headData, rest) = try? await readRequestHead(),
-              let rewritten = ProxyHTTP.rewriteHead(headData, appName: appName)
-        else {
+        guard let (headData, rest) = try? await readRequestHead() else {
+            await sendError(status: 400, reason: "Bad Request", message: "The app request looked malformed.", hint: nil)
+            return
+        }
+
+        // Gate: iOS shares loopback across apps, so only requests presenting
+        // this launch's secret may ride the authorized tunnel. Checked before
+        // any stream opens — a stranger never reaches the server.
+        guard ProxyAuth.isAuthorized(head: headData) else {
+            print("[ProxyTunnel] rejected unauthorized request for \(appName)")
+            await sendError(
+                status: 403,
+                reason: "Forbidden",
+                message: "This port belongs to Raemote Connector.",
+                hint: "Open the app inside Raemote Connector."
+            )
+            return
+        }
+
+        guard let rewritten = ProxyHTTP.rewriteHead(headData, appName: appName) else {
             await sendError(status: 400, reason: "Bad Request", message: "The app request looked malformed.", hint: nil)
             return
         }

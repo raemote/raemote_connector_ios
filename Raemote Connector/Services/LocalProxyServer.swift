@@ -9,6 +9,10 @@ import Network
 ///
 /// This is what makes web apps reachable on a physical device: `127.0.0.1`
 /// inside WKWebView means this proxy, not the developer's machine.
+///
+/// Because iOS shares loopback across apps, the tunnel is gated: a request
+/// must present this launch's secret (`ProxyAuth`) or it is refused with a
+/// 403 before any iroh stream opens.
 nonisolated final class LocalProxyServer: @unchecked Sendable {
     private let queue = DispatchQueue(label: "com.raemote.LocalProxyServer")
     private let appName: String

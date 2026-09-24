@@ -140,6 +140,11 @@ final class WebAppSessionManager {
         }
         session.startingProxy = true
         defer { session.startingProxy = false }
+        // Install the launch's loopback-gate secret *before* any suspension
+        // that the life fence guards — the cookie doesn't depend on the port,
+        // and leaving it after the fence would open a gap where a close during
+        // the await lets us set proxyURL on a session that is already gone.
+        await ProxyAuth.installCookie()
         let server = LocalProxyServer(
             nodeId: session.key.nodeId,
             appName: session.key.app,
@@ -160,7 +165,8 @@ final class WebAppSessionManager {
         session.proxy = server
         // WKWebView talks to this loopback proxy, which relays over iroh to
         // the raemote server. The launch path (e.g. `/?token=…`) encodes on
-        // first run only.
+        // first run only. The cookie was installed above, before this URL can
+        // ever be handed to the web view.
         guard let url = URL(string: "http://127.0.0.1:\(port)\(launchPath ?? "/")") else {
             server.stop()
             session.proxy = nil

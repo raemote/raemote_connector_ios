@@ -760,7 +760,15 @@ struct AppWebView: View {
             case .file:
                 // Re-fetch through the loopback proxy and share the actual file,
                 // so the sheet offers whatever the installed apps support.
-                let (temp, response) = try await URLSession.shared.download(from: url)
+                // URLSession doesn't share the web view's cookie store, so it
+                // presents the gate secret as a header — but only to loopback:
+                // a page that navigated off-origin must never leak the secret
+                // to whoever it landed on.
+                var request = URLRequest(url: url)
+                if url.host == "127.0.0.1" || url.host == "localhost" {
+                    request.setValue(ProxyAuth.secret, forHTTPHeaderField: ProxyAuth.headerName)
+                }
+                let (temp, response) = try await URLSession.shared.download(for: request)
                 let filename = WebShare.fileFilename(
                     url: url,
                     appName: appName,
