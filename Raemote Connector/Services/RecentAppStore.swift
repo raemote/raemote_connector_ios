@@ -5,7 +5,7 @@ import Observation
 /// "Recent" row that outlives a stopped app (and an app relaunch).
 ///
 /// This is deliberately separate from `WebAppSessionManager`: a session is a
-/// *live* app (proxy + web view, gone once closed), while a recent is just the
+/// *live* app (proxy up, gone once closed), while a recent is just the
 /// fact that you used it. Stopping an app — or restarting the whole daemon —
 /// leaves its entry here; only opening it again moves it to the front.
 ///

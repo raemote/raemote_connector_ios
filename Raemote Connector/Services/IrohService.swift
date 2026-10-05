@@ -44,71 +44,6 @@ enum IrohConnectionState: Equatable, Sendable {
     case disconnected(String?)
 }
 
-/// How the live serve connection currently reaches the server.
-nonisolated enum IrohPathKind: Equatable, Sendable {
-    /// No selected path yet — still connecting, or the connection is down.
-    case unknown
-    /// A direct peer-to-peer path (the NAT-traversed IP path).
-    case direct
-    /// Application data is being forwarded through a relay.
-    case relayed
-
-    /// Classify a set of open paths.
-    ///
-    /// The **selected** path is what carries application data, so it decides.
-    /// That matters: iroh usually holds a relay path open as a fallback and may
-    /// start on it before hole-punching upgrades the connection to a direct
-    /// path, so this flips from `.relayed` to `.direct` on its own.
-    init(paths: [IrohPathFacts]) {
-        if let selected = paths.first(where: \.isSelected) {
-            self = selected.isRelay ? .relayed : (selected.isIp ? .direct : .unknown)
-        } else if paths.contains(where: { $0.isIp && !$0.isRelay }) {
-            self = .direct
-        } else if paths.contains(where: \.isRelay) {
-            self = .relayed
-        } else {
-            self = .unknown
-        }
-    }
-}
-
-/// The parts of an iroh `PathSnapshot` that decide direct vs relayed.
-///
-/// Kept as plain data so the decision above is unit-testable: the FFI record
-/// can't be constructed from the test target.
-nonisolated struct IrohPathFacts: Equatable, Sendable {
-    var isSelected: Bool
-    var isIp: Bool
-    var isRelay: Bool
-
-    init(isSelected: Bool, isIp: Bool, isRelay: Bool) {
-        self.isSelected = isSelected
-        self.isIp = isIp
-        self.isRelay = isRelay
-    }
-
-    init(_ snapshot: PathSnapshot) {
-        self.init(
-            isSelected: snapshot.isSelected,
-            isIp: snapshot.isIp,
-            isRelay: snapshot.isRelay
-        )
-    }
-}
-
-/// The live connection's path state, bound to the server it describes, so a
-/// stale or in-flight update can never be shown for a different server.
-nonisolated struct IrohPathState: Equatable, Sendable {
-    var nodeId: String
-    var kind: IrohPathKind
-
-    /// The kind for `nodeId`, or `nil` when the recorded path belongs to
-    /// another server.
-    func kind(for nodeId: String) -> IrohPathKind? {
-        self.nodeId == nodeId ? kind : nil
-    }
-}
-
 /// Observable mirror of the iroh serve connection, updated by `IrohService`.
 ///
 /// `IrohService` is an actor and can't be observed directly by SwiftUI, so it
@@ -122,23 +57,45 @@ nonisolated struct IrohPathState: Equatable, Sendable {
 @Observable
 final class IrohConnectionMonitor {
     private(set) var states: [String: IrohConnectionState] = [:]
-    /// How the live serve connection reaches the server, when known.
-    var path: IrohPathState?
+    /// Where state transitions are recorded (injectable so tests never share
+    /// the app-wide buffer).
+    private let log: ConnectionLog
+
+    init(log: ConnectionLog? = nil) {
+        // `nil` in the default argument (default args evaluate outside the
+        // main actor, where `.shared` is unusable).
+        self.log = log ?? .shared
+    }
 
     /// The state recorded for `nodeId`, or `.unknown` when nothing is known.
     func state(for nodeId: String) -> IrohConnectionState {
         states[nodeId] ?? .unknown
     }
 
-    /// Record `state` for `nodeId`.
+    /// Record `state` for `nodeId`. An actual *change* is appended to the
+    /// connection log as a transition; a no-op write is not.
     func setState(_ state: IrohConnectionState, for nodeId: String) {
+        let previous = states[nodeId] ?? .unknown
+        guard previous != state else { return }
         states[nodeId] = state
+        log.append(
+            "state: \(Self.describe(previous)) → \(Self.describe(state))",
+            nodeId: nodeId
+        )
     }
 
     /// Forget every server's state (the endpoint was torn down).
     func reset() {
         states.removeAll()
-        path = nil
+    }
+
+    private static func describe(_ state: IrohConnectionState) -> String {
+        switch state {
+        case .unknown: "unknown"
+        case .connecting: "connecting"
+        case .connected: "connected"
+        case .disconnected(let reason): reason.map { "disconnected(\($0))" } ?? "disconnected"
+        }
     }
 }
 
@@ -173,12 +130,11 @@ actor IrohService {
     private var connections: [String: ServeConnection] = [:]
     /// The drop-watcher task per live connection.
     private var watchers: [String: Task<Void, Never>] = [:]
-    /// The server the UI (detail/web view) is focused on: the default
-    /// `httpRequest` target and which server the sampled transport path
-    /// describes. Connection *state* is per node (`IrohConnectionMonitor`), so
+    /// The server the UI (detail/app host) is focused on: the default
+    /// `httpRequest` target. Connection *state* is per node (`IrohConnectionMonitor`), so
     /// focus does not select it. Explicit `nodeId` parameters always win.
     private var activeNodeId: String?
-    /// In-flight connect tasks per node, so a burst of callers (web view +
+    /// In-flight connect tasks per node, so a burst of callers (app host +
     /// revalidation) shares one dial instead of racing several.
     private var connecting: [String: Task<Connection, Error>] = [:]
     /// Consecutive connect failures per node, used to decide when the endpoint
@@ -214,6 +170,18 @@ actor IrohService {
 
     init(monitor: IrohConnectionMonitor) {
         self.monitor = monitor
+    }
+
+    /// Record a connection-diagnosis event in the shared `ConnectionLog`
+    /// (which also prints it to the console).
+    ///
+    /// Fire-and-forget onto the main actor so even *sync* actor methods can
+    /// call it without introducing an await — and thus without widening a race
+    /// window in code that is currently atomic. Ordering is best-effort.
+    private nonisolated func log(_ message: String, nodeId: String? = nil) {
+        Task { @MainActor in
+            ConnectionLog.shared.append(message, nodeId: nodeId)
+        }
     }
 
     // MARK: - Identity
@@ -262,6 +230,7 @@ actor IrohService {
             alpns: []
         ))
         endpoint = ep
+        log("endpoint bound (id: \(ep.id()))")
         return ep
     }
 
@@ -273,7 +242,7 @@ actor IrohService {
 
         do {
             let ep = try await ensureEndpoint()
-            print("[IrohService] my endpoint id: \(ep.id())")
+            log("pairing: my endpoint id: \(ep.id())", nodeId: serverNodeId)
 
             let remoteId = try EndpointId.fromString(s: serverNodeId)
             let remoteAddr = EndpointAddr(id: remoteId, relayUrl: nil, addresses: [])
@@ -281,7 +250,7 @@ actor IrohService {
             // 1. Auth: connect over bind ALPN, send token, read response, close.
             //    No timeout here: a slow first connection is common, and the UI
             //    offers a Cancel Pairing button after a while instead.
-            print("[IrohService] connecting over bind ALPN...")
+            log("pairing: connecting over bind ALPN…", nodeId: serverNodeId)
             let bindConn = try await withoutTimeout {
                 try await ep.connect(addr: remoteAddr, alpn: Self.bindAlpn)
             }
@@ -293,7 +262,7 @@ actor IrohService {
             let response = try await bi.recv().readToEnd(sizeLimit: 1024)
             let line = String(decoding: response, as: UTF8.self)
                 .trimmingCharacters(in: .whitespacesAndNewlines)
-            print("[IrohService] bind response: \(line)")
+            log("pairing: bind response: \(line)", nodeId: serverNodeId)
 
             guard line == "OK" else {
                 let reason = line.hasPrefix("DENY ") ? String(line.dropFirst(5)) : line
@@ -304,17 +273,19 @@ actor IrohService {
             try bindConn.close(errorCode: 0, reason: Data("bind ok".utf8))
 
             // 2. Open a persistent connection over the serve ALPN.
-            print("[IrohService] connecting over serve ALPN...")
+            log("pairing: connecting over serve ALPN…", nodeId: serverNodeId)
             _ = try await connectAndAdopt(nodeId: serverNodeId, timeout: nil)
             await setState(.connected, for: serverNodeId)
             // Tell the server how this device should be named (best effort).
             try? await setDeviceName(DeviceNameStore.name, nodeId: serverNodeId)
-            print("[IrohService] bound and ready")
+            log("pairing: bound and ready", nodeId: serverNodeId)
         } catch is CancellationError {
             // The user aborted pairing; don't leave a misleading reason behind.
+            log("pairing: cancelled", nodeId: serverNodeId)
             await setState(.disconnected(nil), for: serverNodeId)
             throw CancellationError()
         } catch {
+            log("pairing failed: \(error.localizedDescription)", nodeId: serverNodeId)
             await setState(.disconnected(error.localizedDescription), for: serverNodeId)
             throw error
         }
@@ -338,20 +309,17 @@ actor IrohService {
     }
 
     /// Marks which server the UI is presenting, so the parameterless
-    /// `httpRequest` and the sampled transport path describe that server.
+    /// `httpRequest` targets that server when no node id is passed.
     private func setFocus(_ nodeId: String) async {
-        if activeNodeId != nodeId {
-            activeNodeId = nodeId
-            // Any sampled path describes the *previous* focus; drop it so the
-            // UI never shows another server's transport info. The path-binding
-            // check (`IrohPathState.kind(for:)`) is the second guard.
-            let monitor = monitor
-            await MainActor.run { monitor.path = nil }
-        }
+        activeNodeId = nodeId
     }
 
     /// Actively verify the serve connection (used when the app returns to the
     /// foreground). Reconnects if the connection is gone, stale, or unusable.
+    ///
+    /// Every outcome is logged, and a failure now records *why* in the
+    /// monitor — previously the connect/probe errors were swallowed and the
+    /// indicator could sit on a stale state with no reason shown.
     func validateConnection(nodeId: String) async {
         await setFocus(nodeId)
         // Drop a connection whose close reason is known, or that has been idle
@@ -363,15 +331,19 @@ actor IrohService {
                 lastUsed: cached.lastUsed,
                 hasOpenStream: (openStreams[nodeId] ?? 0) > 0
             ) {
+            log("revalidate: dropping stale/closed connection", nodeId: nodeId)
             retire(nodeId, matching: cached.conn, reason: "stale")
         }
         do {
             try await ensureConnection(nodeId: nodeId)
         } catch {
+            log("revalidate: connect failed: \(error.localizedDescription)", nodeId: nodeId)
+            await setState(.disconnected(error.localizedDescription), for: nodeId)
             return
         }
         // Confirm it is actually usable. A short deadline means a dead
         // connection is detected in seconds, not the full request timeout.
+        let probeStart = Date()
         do {
             _ = try await httpRequest(
                 method: "GET",
@@ -379,10 +351,13 @@ actor IrohService {
                 nodeId: nodeId,
                 timeout: Self.validateTimeout
             )
+            let ms = Int(Date().timeIntervalSince(probeStart) * 1000)
+            log("revalidate: probe ok in \(ms)ms", nodeId: nodeId)
             await setState(.connected, for: nodeId)
         } catch {
+            log("revalidate: probe failed: \(error.localizedDescription)", nodeId: nodeId)
             retire(nodeId, matching: connections[nodeId]?.conn, reason: "validation failed")
-            await setState(.disconnected("connection unusable"), for: nodeId)
+            await setState(.disconnected(error.localizedDescription), for: nodeId)
         }
     }
 
@@ -400,7 +375,7 @@ actor IrohService {
         guard ConnectionFreshness.isTrustworthy(lastUsed: cached.lastUsed, hasOpenStream: hasStream)
         else {
             let idle = Int(Date().timeIntervalSince(cached.lastUsed))
-            print("[IrohService] dropping idle connection to \(nodeId.prefix(8)) (idle \(idle)s)")
+            log("dropping idle connection to \(nodeId.prefix(8)) (idle \(idle)s)", nodeId: nodeId)
             retire(nodeId, matching: cached.conn, reason: "stale")
             return nil
         }
@@ -446,6 +421,11 @@ actor IrohService {
         if let inflight = connecting[nodeId], !inflight.isCancelled {
             return try await inflight.value
         }
+        let dialStart = Date()
+        log(
+            "dialing \(nodeId.prefix(8)) (timeout: \(timeout.map { "\(Int($0))s" } ?? "none"))",
+            nodeId: nodeId
+        )
         let task = Task {
             let ep = try await ensureEndpoint()
             let remoteId = try EndpointId.fromString(s: nodeId)
@@ -457,13 +437,17 @@ actor IrohService {
         do {
             let conn = try await task.value
             connectFailures[nodeId] = nil
+            let seconds = String(format: "%.1f", Date().timeIntervalSince(dialStart))
+            log("connected to \(nodeId.prefix(8)) in \(seconds)s", nodeId: nodeId)
             return conn
         } catch {
             // A rejected (revoked) device is not a discovery problem; retrying
             // with a fresh endpoint would churn for nothing.
             if case IrohError.bindDenied = error {
+                log("dial rejected: \(error.localizedDescription)", nodeId: nodeId)
                 throw error
             }
+            log("dial failed: \(error.localizedDescription)", nodeId: nodeId)
             await noteConnectFailure(nodeId)
             throw error
         }
@@ -489,7 +473,7 @@ actor IrohService {
         connectFailures[nodeId] = nil
         lastEndpointRebuild = .now
         guard let stale = endpoint else { return }
-        print("[IrohService] \(failures) failed dials to \(nodeId.prefix(8)); rebuilding the endpoint to redo discovery")
+        log("\(failures) failed dials to \(nodeId.prefix(8)); rebuilding the endpoint to redo discovery", nodeId: nodeId)
         endpoint = nil
         try? await stale.close()
     }
@@ -539,26 +523,6 @@ actor IrohService {
         return conn
     }
 
-    /// Sample how the live connection reaches the server and publish it.
-    ///
-    /// This is deliberately a pull, not `Connection.watchPaths`: the sync
-    /// `watch_*` FFI methods in the pinned `iroh-ffi` prebuilt (v1.1.0) call
-    /// `tokio::spawn` on the *caller's* thread, which has no tokio runtime, and
-    /// abort the process with "there is no reactor running". Upstream fixed it
-    /// after v1.1.0 (iroh-ffi #281), but the app links the v1.1.0 prebuilt, so
-    /// `paths()` (a plain snapshot, no spawn) is the safe surface. A couple of
-    /// seconds of lag is fine for a transport indicator.
-    func refreshPathKind(nodeId: String) async {
-        // Only sample an alive connection; an idle one is left alone here (the
-        // staleness window is applied when it is next *used*, never by polling,
-        // so a running-but-quiet tunnel is not torn down).
-        guard let cached = connections[nodeId], cached.conn.closeReason() == nil else {
-            return
-        }
-        let kind = IrohPathKind(paths: cached.conn.paths().map(IrohPathFacts.init))
-        await MainActor.run { monitor.path = IrohPathState(nodeId: nodeId, kind: kind) }
-    }
-
     private func connectionDropped(_ conn: Connection, nodeId: String, reason: String) async {
         // Identity fence: only retire the map entry this watcher was created
         // for. A dropped OLD connection after a reconnect must not tear down
@@ -567,7 +531,7 @@ actor IrohService {
         connections[nodeId] = nil
         watchers[nodeId]?.cancel()
         watchers[nodeId] = nil
-        print("[IrohService] serve connection dropped: \(nodeId.prefix(8)) \(reason)")
+        log("serve connection dropped: \(reason)", nodeId: nodeId)
         // Recorded for *this* node only, so a drop on one server never shows up
         // as another server's state.
         await setState(.disconnected(reason), for: nodeId)
@@ -577,11 +541,6 @@ actor IrohService {
         let monitor = self.monitor
         await MainActor.run {
             monitor.setState(state, for: nodeId)
-            // A path only describes a live connection; drop it otherwise so the
-            // UI never shows a stale "direct"/"relayed" for a dead connection.
-            if state != .connected, monitor.path?.nodeId == nodeId {
-                monitor.path = nil
-            }
         }
     }
 
@@ -608,7 +567,7 @@ actor IrohService {
         var request = Data(head.utf8)
         if let body { request.append(body) }
 
-        print("[IrohService] \(method) \(path) — opening bi-stream")
+        log("\(method) \(path) — opening bi-stream", nodeId: nodeId ?? activeNodeId)
         let raw = try await send(
             request,
             sizeLimit: 1_000_000,
@@ -639,7 +598,7 @@ actor IrohService {
                 markUsed(nodeId, conn)
                 return data
             } catch {
-                print("[IrohService] request failed, will reconnect: \(error)")
+                log("request failed, will reconnect: \(error)", nodeId: nodeId)
                 // Only retire the entry that actually failed: a concurrent
                 // reconnect may have adopted a different connection under the
                 // same key while this exchange was in flight.
@@ -827,7 +786,7 @@ actor IrohService {
                 try await ensureConnection(nodeId: nodeId, focus: false)
                 try await setDeviceName(name, nodeId: nodeId)
             } catch {
-                print("[IrohService] could not set device name on \(nodeId.prefix(8)): \(error)")
+                log("could not set device name: \(error)", nodeId: nodeId)
             }
         }
     }
@@ -867,6 +826,7 @@ actor IrohService {
         openStreams.removeAll()
         activeNodeId = nil
         endpoint = nil
+        log("endpoint torn down")
         let monitor = monitor
         await MainActor.run { monitor.reset() }
     }

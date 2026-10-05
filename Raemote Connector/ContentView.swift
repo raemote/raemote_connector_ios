@@ -3,9 +3,8 @@ import SwiftUI
 /// A destination in the root navigation stack.
 ///
 /// `.app` is a single host screen whose *content* follows
-/// `sessionManager.activeKey`, not a per-app route. Switching apps therefore
-/// only changes `activeKey`, so the stack never churns and the presented web
-/// view is always the active session's.
+/// `sessionManager.activeKey`, not a per-app route: opening an app that is
+/// already hosting only swaps the active session, so the stack never churns.
 enum Route: Hashable {
     case server(Server)
     case app
@@ -190,11 +189,7 @@ struct ContentView: View {
             AppHostView(
                 sessionManager: sessionManager,
                 irohService: irohService,
-                monitor: connectionMonitor,
-                onSwitchSession: { switchApp($0) },
-                onAppsUpdated: { nodeId, apps in
-                    updateServerApps(nodeId: nodeId, apps: apps)
-                }
+                monitor: connectionMonitor
             )
         }
     }
@@ -356,17 +351,11 @@ struct ContentView: View {
 
     /// Open an app: ensure its session exists, make it the active one, and push
     /// the single app host. Called from the server detail and the Recent row.
+    /// (While the host is already on top — e.g. a deep link — this just swaps
+    /// the active session; `pathAfterOpen` leaves the path alone.)
     private func openApp(_ key: WebAppSessionKey) {
         present(key)
         path = Self.pathAfterOpen(from: path)
-    }
-
-    /// Switch the presented app from the in-app strip: swap in place when the
-    /// host is already the top of the stack (no navigation churn), otherwise
-    /// collapse to the host so the back gesture returns to the main list.
-    private func switchApp(_ key: WebAppSessionKey) {
-        present(key)
-        path = Self.pathAfterSwitch(from: path)
     }
 
     /// Make `key` the live, presented session (opening it if needed) and note it
@@ -382,13 +371,6 @@ struct ContentView: View {
     /// when it is already the host.
     static func pathAfterOpen(from current: [Route]) -> [Route] {
         current.last == .app ? current : current + [.app]
-    }
-
-    /// A switch collapses the stack to a single app host, so the back gesture
-    /// always returns to the main list; when it is already just the host the
-    /// path is untouched (switching must not churn navigation).
-    static func pathAfterSwitch(from current: [Route]) -> [Route] {
-        current == [.app] ? current : [.app]
     }
 
     private func serverRow(_ server: Server) -> some View {
@@ -450,7 +432,7 @@ struct ContentView: View {
     }
 
     /// Tell the icon store where each catalog app keeps its favicon, so rows
-    /// and the switcher strip can load icons by `(nodeId, app)` alone.
+    /// and the Recent chips can load icons by `(nodeId, app)` alone.
     private func registerAppIcons() {
         for server in servers {
             AppIconStore.shared.register(nodeId: server.nodeId, apps: server.apps)

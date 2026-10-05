@@ -121,11 +121,6 @@ final class AppIconStore {
         descriptors[WebAppSessionKey(nodeId: nodeId, app: app)]?.path
     }
 
-    /// The app's catalog port (used to version its cached icon), or `0`.
-    func port(nodeId: String, app: String) -> Int {
-        descriptors[WebAppSessionKey(nodeId: nodeId, app: app)]?.port ?? 0
-    }
-
     /// A stable string describing where an app's icon lives. A view uses it as
     /// its task identity, so a catalog refresh that supplies (or moves) the
     /// icon path refetches instead of silently keeping a stale result.

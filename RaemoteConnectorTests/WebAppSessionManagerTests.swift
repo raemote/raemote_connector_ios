@@ -1,14 +1,20 @@
 import Testing
 import Foundation
+import UIKit
 @testable import Raemote_Connector
 
 @MainActor
 struct WebAppSessionManagerTests {
 
-    private func makeManager() -> WebAppSessionManager {
+    private func makeManager(rack: WebAppTabRack? = nil) -> WebAppSessionManager {
         // The registry tests never start a proxy; an unconnected service is
-        // fine for building the manager.
-        WebAppSessionManager(service: IrohService(monitor: IrohConnectionMonitor()))
+        // fine for building the manager. The rack's factory is only invoked
+        // when a test explicitly creates a warm page (with a stub rack).
+        WebAppSessionManager(service: IrohService(monitor: IrohConnectionMonitor()), rack: rack)
+    }
+
+    private func stubRack() -> WebAppTabRack {
+        WebAppTabRack { _ in UIViewController() }
     }
 
     @Test func sameAppOnTwoServersIsTwoSessions() {
@@ -45,7 +51,7 @@ struct WebAppSessionManagerTests {
         var keys: [WebAppSessionKey] = []
         for i in 0..<WebAppSessionManager.maxSessions {
             let key = WebAppSessionKey(nodeId: "node", app: "app-\(i)")
-            manager.open(nodeId: key.nodeId, app: key.app)
+            _ = manager.open(nodeId: key.nodeId, app: key.app)
             // Deterministic LRU ordering: app-0 was used least recently.
             manager.session(for: key)?.lastActivated = Date(timeIntervalSince1970: TimeInterval(i + 1))
             keys.append(key)
@@ -67,7 +73,7 @@ struct WebAppSessionManagerTests {
     @Test func evictionNeverTakesTheActiveSession() throws {
         let manager = makeManager()
         let anchored = WebAppSessionKey(nodeId: "node", app: "anchored")
-        manager.open(nodeId: anchored.nodeId, app: anchored.app)
+        _ = manager.open(nodeId: anchored.nodeId, app: anchored.app)
         manager.activate(anchored)
         // Older than everything else, yet still not a candidate: the presented
         // session is the one that must not be torn down.
@@ -83,7 +89,7 @@ struct WebAppSessionManagerTests {
     @Test func closeClearsActiveKeyWhenItIsTheClosedOne() {
         let manager = makeManager()
         let key = WebAppSessionKey(nodeId: "n", app: "a")
-        manager.open(nodeId: key.nodeId, app: key.app)
+        _ = manager.open(nodeId: key.nodeId, app: key.app)
         manager.activate(key)
         #expect(manager.isActive(key))
 
@@ -94,9 +100,9 @@ struct WebAppSessionManagerTests {
 
     @Test func deletingAServerClosesOnlyThatServersSessions() {
         let manager = makeManager()
-        manager.open(nodeId: "server-a", app: "one")
-        manager.open(nodeId: "server-a", app: "two")
-        manager.open(nodeId: "server-b", app: "one")
+        _ = manager.open(nodeId: "server-a", app: "one")
+        _ = manager.open(nodeId: "server-a", app: "two")
+        _ = manager.open(nodeId: "server-b", app: "one")
 
         manager.closeRunningSessions(nodeId: "server-a")
 
@@ -137,5 +143,114 @@ struct WebAppSessionManagerTests {
             _ = url
         }
         #expect(manager.session(for: key) == nil)
+    }
+
+    // MARK: - Warm tab rack lifecycle
+
+    @Test func closeDestroysTheWarmPage() {
+        let rack = stubRack()
+        let manager = makeManager(rack: rack)
+        let key = WebAppSessionKey(nodeId: "n", app: "app1")
+        _ = manager.open(nodeId: key.nodeId, app: key.app)
+        _ = rack.controller(for: key, url: URL(string: "http://127.0.0.1:1/")!)
+        #expect(rack.hasController(for: key))
+
+        manager.close(key)
+        #expect(!rack.hasController(for: key), "close is the teardown choke point")
+        #expect(rack.controllerCount == 0)
+    }
+
+    @Test func serverRemovalDestroysOnlyThatServersPages() {
+        let rack = stubRack()
+        let manager = makeManager(rack: rack)
+        let a1 = WebAppSessionKey(nodeId: "server-a", app: "one")
+        let a2 = WebAppSessionKey(nodeId: "server-a", app: "two")
+        let b1 = WebAppSessionKey(nodeId: "server-b", app: "one")
+        for key in [a1, a2, b1] {
+            _ = manager.open(nodeId: key.nodeId, app: key.app)
+            _ = rack.controller(for: key, url: URL(string: "http://127.0.0.1:1/")!)
+        }
+
+        manager.closeRunningSessions(nodeId: "server-a")
+
+        #expect(!rack.hasController(for: a1))
+        #expect(!rack.hasController(for: a2))
+        #expect(rack.hasController(for: b1), "another server's page is untouched")
+    }
+
+    @Test func lruSessionEvictionDestroysItsPage() {
+        let rack = stubRack()
+        let manager = makeManager(rack: rack)
+        let keys = (0..<WebAppSessionManager.maxSessions).map { i in
+            WebAppSessionKey(nodeId: "node", app: "app-\(i)")
+        }
+        for (i, key) in keys.enumerated() {
+            _ = manager.open(nodeId: key.nodeId, app: key.app)
+            _ = rack.controller(for: key, url: URL(string: "http://127.0.0.1:1/")!)
+            // Deterministic LRU ordering: app-0 is least recently used.
+            manager.session(for: key)?.lastActivated = Date(timeIntervalSince1970: TimeInterval(i + 1))
+        }
+        #expect(rack.controllerCount == WebAppSessionManager.maxSessions)
+
+        _ = manager.open(nodeId: "node", app: "extra")
+
+        #expect(!rack.hasController(for: keys[0]), "evicted session's page goes with it")
+        #expect(rack.controllerCount == WebAppSessionManager.maxSessions - 1)
+        #expect(manager.runningCount == WebAppSessionManager.maxSessions)
+    }
+
+    @Test func memoryWarningDropsTheLruBackgroundPageButKeepsTheSession() {
+        let rack = stubRack()
+        let manager = makeManager(rack: rack)
+        let active = WebAppSessionKey(nodeId: "node", app: "active")
+        let background = WebAppSessionKey(nodeId: "node", app: "background")
+        for key in [active, background] {
+            _ = manager.open(nodeId: key.nodeId, app: key.app)
+            _ = rack.controller(for: key, url: URL(string: "http://127.0.0.1:1/")!)
+        }
+        manager.activate(active)
+        manager.session(for: background)?.lastActivated = Date(timeIntervalSince1970: 1)
+
+        manager.evictWarmPageUnderPressure()
+
+        #expect(!rack.hasController(for: background), "LRU background page dropped")
+        #expect(rack.hasController(for: active), "active page never evicted")
+        // The session itself survives: proxy, green dot, and Recent tile stay;
+        // only the page is recreated on next mount.
+        #expect(manager.isRunning(background))
+        #expect(manager.runningCount == 2)
+    }
+
+    @Test func memoryWarningEvictsNothingWhenOnlyTheActivePageExists() {
+        let rack = stubRack()
+        let manager = makeManager(rack: rack)
+        let key = WebAppSessionKey(nodeId: "node", app: "only")
+        _ = manager.open(nodeId: key.nodeId, app: key.app)
+        _ = rack.controller(for: key, url: URL(string: "http://127.0.0.1:1/")!)
+        manager.activate(key)
+
+        manager.evictWarmPageUnderPressure()
+
+        #expect(rack.hasController(for: key))
+        #expect(manager.isRunning(key))
+    }
+
+    @Test func memoryWarningSkipsSessionsWithoutAPage() {
+        let rack = stubRack()
+        let manager = makeManager(rack: rack)
+        let paged = WebAppSessionKey(nodeId: "node", app: "paged")
+        let neverMounted = WebAppSessionKey(nodeId: "node", app: "never-mounted")
+        _ = manager.open(nodeId: paged.nodeId, app: paged.app)
+        _ = rack.controller(for: paged, url: URL(string: "http://127.0.0.1:1/")!)
+        _ = manager.open(nodeId: neverMounted.nodeId, app: neverMounted.app)
+        // The oldest session, but it never got a page — it can be neither the
+        // victim (nothing to destroy) nor a reason to drop the real page.
+        manager.session(for: neverMounted)?.lastActivated = Date(timeIntervalSince1970: 0)
+        manager.activate(paged)
+
+        manager.evictWarmPageUnderPressure()
+
+        #expect(rack.hasController(for: paged))
+        #expect(manager.runningCount == 2)
     }
 }

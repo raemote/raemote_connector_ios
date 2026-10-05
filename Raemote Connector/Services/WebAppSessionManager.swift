@@ -1,11 +1,12 @@
+import Combine
 import Observation
 import SwiftUI
-import WebKit
+import UIKit
 
 /// How a running web app is identified: one server node + one catalog app.
-/// Everything the session owns (proxy port, web view, page state) is bound to
-/// this pair; two servers can run an identically-named app without ever
-/// sharing state (the NodeId-isolation rule).
+/// Everything the session owns (proxy port, launch URL) is bound to this pair;
+/// two servers can run an identically-named app without ever sharing state
+/// (the NodeId-isolation rule).
 struct WebAppSessionKey: Hashable, Identifiable, Sendable {
     let nodeId: String
     let app: String
@@ -13,24 +14,17 @@ struct WebAppSessionKey: Hashable, Identifiable, Sendable {
     var id: String { "\(nodeId)/\(app)" }
 }
 
-/// One background web app: a bound loopback `LocalProxyServer` and one
-/// long-lived `WKWebView`. Leaving the presenter keeps the session running
-/// (tunnel up, page state warm); "Close" is the only thing that ends one.
+/// One background web app: a bound loopback `LocalProxyServer`. Leaving the
+/// presenter keeps the session running (tunnel up); "Close" is the only thing
+/// that ends one. Its page lives as a warm tab in the session's rack, so
+/// switching away and back preserves scroll/JS/media state exactly as it was.
 @MainActor
 @Observable
 final class WebAppSession {
     let key: WebAppSessionKey
-    /// The stable loopback origin once the proxy is listening.
+    /// The stable loopback origin once the proxy is listening, with the gate
+    /// secret appended so the browser bootstraps its cookie on first load.
     var proxyURL: URL?
-    /// Session-scoped page state (loading/error/history flags), so switching
-    /// apps keeps each page's own spinner or banner.
-    let state = WebViewState()
-    /// The session's web view, strongly owned by the session so it survives
-    /// being detached from the view hierarchy (a `weak` reference would drop
-    /// it the moment the presenter goes away — and a re-present would then
-    /// build a fresh, blank one). Created once by the presenter; nulled only
-    /// by `close`.
-    @ObservationIgnored var webView: WKWebView?
     /// Source of the LRU eviction ordering.
     @ObservationIgnored var lastActivated: Date = .distantPast
 
@@ -38,13 +32,6 @@ final class WebAppSession {
     /// Set while the first `start()` is in flight, so a burst of presenters
     /// doesn't race two listeners onto one origin.
     fileprivate var startingProxy = false
-    /// The first meaningful page title has been recorded (title capture is
-    /// once per session, not per presentation).
-    @ObservationIgnored var capturedTitle = false
-    /// The URL the shared web view was last pointed at. The session (not the
-    /// per-representation coordinator) owns this, so re-presenting a warm
-    /// session skips the reload and pages resume exactly where they were.
-    @ObservationIgnored var lastLoadedURL: URL?
 
     init(key: WebAppSessionKey) {
         self.key = key
@@ -60,18 +47,18 @@ final class WebAppSession {
 /// - One session per `(nodeId, app)`: the same app on two servers is two
 ///   sessions (NodeId-isolated — this is the resource-isolation rule).
 /// - Sessions are capped: launching beyond the cap evicts the least-recently
-///   *used* one (proxy stopped, web view discarded; site data survives in the
-///   persistent data store). Usage — not insertion order — decides, so the five
-///   apps you touched most recently are the five that stay warm. Eviction is
-///   only ever about memory: the app's "Recent" tile is untouched
-///   (`RecentAppStore`), so it stays one tap away.
+///   *used* one (its proxy stops; site data survives in Safari's persistent
+///   store on the stable origin). Usage — not insertion order — decides, so
+///   the five apps you touched most recently are the five that stay one tap
+///   from warm. Eviction is only ever about resources: the app's "Recent"
+///   tile is untouched (`RecentAppStore`), so it stays one tap away.
 /// - Sessions live for the app's process lifetime; no cross-relaunch state.
 @MainActor
 @Observable
 final class WebAppSessionManager {
-    /// Max simultaneously running apps. Each WKWebView is a render process;
-    /// past this point the system starts killing the app under memory
-    /// pressure.
+    /// Max simultaneously running apps (each is a loopback listener plus its
+    /// iroh tunnel); past this point the oldest unused session is evicted —
+    /// proxy stopped *and* warm tab destroyed.
     static let maxSessions = 5
 
     private var sessions: [WebAppSessionKey: WebAppSession] = [:]
@@ -81,13 +68,35 @@ final class WebAppSessionManager {
 
     private let service: IrohService
 
-    init(service: IrohService) {
+    /// Warm tab controllers for live sessions. Owned here so every session
+    /// teardown path (`close`, LRU eviction, server removal, `closeAll`)
+    /// destroys its page exactly once. Tests inject a stub factory.
+    let rack: WebAppTabRack
+
+    /// Memory-warning eviction subscription (`AnyCancellable` removes itself
+    /// on deinit — no manual teardown to forget).
+    @ObservationIgnored private var memoryCancellable: AnyCancellable?
+
+    init(service: IrohService, rack: WebAppTabRack? = nil) {
         self.service = service
+        // `nil` in the default argument (default args evaluate outside the
+        // main actor); the real rack is built here, on the main actor.
+        self.rack = rack ?? WebAppTabRack()
+        memoryCancellable = NotificationCenter.default
+            .publisher(for: UIApplication.didReceiveMemoryWarningNotification)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                // The notification block is not actor-isolated; hop so the
+                // eviction runs on the main actor with the manager's state.
+                Task { @MainActor [weak self] in
+                    self?.evictWarmPageUnderPressure()
+                }
+            }
     }
 
     var runningCount: Int { sessions.count }
 
-    /// All running sessions oldest-first (for the list UIs / strip).
+    /// All running sessions oldest-first (for the list UIs).
     var running: [WebAppSession] {
         orderFilter()
     }
@@ -120,7 +129,7 @@ final class WebAppSessionManager {
         return session
     }
 
-    /// Mark `key` the presented session (strip ordering + status sampling).
+    /// Mark `key` the presented session (LRU ordering).
     func activate(_ key: WebAppSessionKey) {
         guard sessions[key] != nil else { return }
         activeKey = key
@@ -132,7 +141,7 @@ final class WebAppSessionManager {
     }
 
     /// Start (or reuse) the session's loopback proxy. `launchPath` applies on
-    /// first start only; later activations resume where the page already is.
+    /// first start only; later activations resume at the same origin.
     func ensureProxy(for session: WebAppSession, launchPath: String?) async throws -> URL {
         if let url = session.proxyURL { return url }
         guard !session.startingProxy else {
@@ -140,11 +149,6 @@ final class WebAppSessionManager {
         }
         session.startingProxy = true
         defer { session.startingProxy = false }
-        // Install the launch's loopback-gate secret *before* any suspension
-        // that the life fence guards — the cookie doesn't depend on the port,
-        // and leaving it after the fence would open a gap where a close during
-        // the await lets us set proxyURL on a session that is already gone.
-        await ProxyAuth.installCookie()
         let server = LocalProxyServer(
             nodeId: session.key.nodeId,
             appName: session.key.app,
@@ -163,23 +167,24 @@ final class WebAppSessionManager {
         }
         ProxyPortStore.remember(port, nodeId: session.key.nodeId, app: session.key.app)
         session.proxy = server
-        // WKWebView talks to this loopback proxy, which relays over iroh to
-        // the raemote server. The launch path (e.g. `/?token=…`) encodes on
-        // first run only. The cookie was installed above, before this URL can
-        // ever be handed to the web view.
+        // The browser talks to this loopback proxy, which relays over iroh to
+        // the raemote server. The launch path (e.g. `/?token=…`) applies on
+        // first run only, and the gate secret rides along as a query item so
+        // the first response can seed the auth cookie (see `ProxyAuth`).
         guard let url = URL(string: "http://127.0.0.1:\(port)\(launchPath ?? "/")") else {
             server.stop()
             session.proxy = nil
             throw IrohError.connectionFailed("invalid launch path")
         }
-        session.proxyURL = url
+        let launchURL = ProxyAuth.authorizedURL(url)
+        session.proxyURL = launchURL
         print("[Sessions] proxy for \(session.key.id) on 127.0.0.1:\(port)")
-        return url
+        return launchURL
     }
 
-    /// Close a running app: stop its loopback proxy and discard the WKWebView.
-    /// Site data (cookies/localStorage) is deliberately kept: the stable
-    /// origin survives across future runs through `ProxyPortStore`.
+    /// Close a running app: stop its loopback proxy. Site data
+    /// (cookies/localStorage) is deliberately kept: the stable origin survives
+    /// across future runs through `ProxyPortStore`.
     ///
     /// Closing the *active* session clears `activeKey`, which is how the
     /// presented app host learns to leave instead of resurrecting it.
@@ -191,12 +196,10 @@ final class WebAppSessionManager {
         }
         session.proxy?.stop()
         session.proxy = nil
-        session.webView?.navigationDelegate = nil
-        session.webView?.uiDelegate = nil
-        session.webView?.removeFromSuperview()
-        session.webView = nil
-        session.state.webView = nil
         session.proxyURL = nil
+        // The session is gone; its warm tab must go with it (this is the one
+        // choke point every teardown path funnels through).
+        rack.destroy(for: key)
         print("[Sessions] closed \(key.id); \(sessions.count) running")
     }
 
@@ -221,6 +224,26 @@ final class WebAppSessionManager {
 
     func closeAll() {
         for key in Array(sessions.keys) { close(key) }
+    }
+
+    /// iOS asked for memory: destroy the least-recently-used **background**
+    /// warm page (never the active tab). The session and its proxy stay alive
+    /// — the green dot, the "Recent" tile, and site data all survive — so the
+    /// tab simply reloads the next time it is mounted. Internal (not private)
+    /// so tests can drive it without posting a real notification.
+    func evictWarmPageUnderPressure() {
+        guard let victim = warmPageEvictionCandidate() else { return }
+        print("[Sessions] memory warning: dropping warm page \(victim.id)")
+        rack.destroy(for: victim)
+    }
+
+    /// The warm page that memory pressure should drop: the least recently
+    /// activated session *other than the active one* that actually has a page.
+    private func warmPageEvictionCandidate() -> WebAppSessionKey? {
+        sessions
+            .filter { $0.key != activeKey && rack.hasController(for: $0.key) }
+            .min { $0.value.lastActivated < $1.value.lastActivated }?
+            .key
     }
 
     /// Evict the least-recently-used sessions down to one free slot so a new

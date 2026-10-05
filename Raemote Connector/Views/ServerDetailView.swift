@@ -13,9 +13,6 @@ struct ServerDetailView: View {
     let onOpenApp: (WebAppSessionKey) -> Void
 
     @State private var apps: [AppInfo]
-    /// Display names learned from each app's live page title, keyed by the
-    /// server's name for the app (`AppNameStore`).
-    @State private var appNames: [String: String]
     /// Optional launch paths (e.g. `/?token=…`) keyed by the server's name for
     /// the app (`AppLaunchStore`).
     @State private var launchPaths: [String: String]
@@ -33,6 +30,8 @@ struct ServerDetailView: View {
     @State private var launchPrompt: AppInfo?
     @State private var launchText = ""
     @State private var invitation: InvitationPresentation?
+    /// The hidden connection-diagnosis modal (long-press the Connection row).
+    @State private var showConnectionLogs = false
 
     /// A minted invitation presented in a sheet.
     private struct InvitationPresentation: Identifiable {
@@ -62,7 +61,6 @@ struct ServerDetailView: View {
         self.onReportedName = onReportedName
         self.onOpenApp = onOpenApp
         _apps = State(initialValue: server.apps)
-        _appNames = State(initialValue: AppNameStore.names(nodeId: server.nodeId))
         _launchPaths = State(initialValue: AppLaunchStore.paths(nodeId: server.nodeId))
         _alias = State(initialValue: server.name)
         _reportedName = State(initialValue: server.reportedName)
@@ -175,6 +173,9 @@ struct ServerDetailView: View {
                 expiresAt: invitation.expiresAt
             )
         }
+        .sheet(isPresented: $showConnectionLogs) {
+            ConnectionLogView(nodeId: server.nodeId, title: displayTitle, monitor: monitor)
+        }
         .task(id: server.nodeId) {
             // Establish/probe the serve connection so the indicator reflects
             // reality as soon as this screen appears.
@@ -268,32 +269,44 @@ struct ServerDetailView: View {
 
     @ViewBuilder
     private var connectionRow: some View {
-        HStack(spacing: 8) {
-            Circle()
-                .fill(statusColor)
-                .frame(width: 10, height: 10)
-            Text("Connection")
-            Spacer()
-            Text(statusText)
-                .foregroundStyle(.secondary)
-            if case .disconnected = connectionState {
-                Button {
-                    Task { await irohService.validateConnection(nodeId: server.nodeId) }
-                } label: {
-                    Image(systemName: "arrow.clockwise")
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 8) {
+                Circle()
+                    .fill(statusColor)
+                    .frame(width: 10, height: 10)
+                Text("Connection")
+                Spacer()
+                Text(statusText)
+                    .foregroundStyle(.secondary)
+                if case .disconnected = connectionState {
+                    Button {
+                        Task { await irohService.validateConnection(nodeId: server.nodeId) }
+                    } label: {
+                        Image(systemName: "arrow.clockwise")
+                    }
+                    .buttonStyle(.bordered)
+                    .buttonBorderShape(.circle)
+                    .controlSize(.small)
+                    .accessibilityLabel("Reconnect")
                 }
-                .buttonStyle(.bordered)
-                .buttonBorderShape(.circle)
-                .controlSize(.small)
-                .accessibilityLabel("Reconnect")
+            }
+
+            if case .disconnected(let reason) = connectionState,
+               let reason, !reason.isEmpty {
+                Text(reason)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
         }
-
-        if case .disconnected(let reason) = connectionState,
-           let reason, !reason.isEmpty {
-            Text(reason)
-                .font(.caption)
-                .foregroundStyle(.secondary)
+        // Hidden diagnosis: long-pressing the Connection row opens a live view
+        // of the captured connection log. Deliberately undiscoverable — there
+        // is no visible affordance.
+        .contentShape(Rectangle())
+        .onLongPressGesture {
+            showConnectionLogs = true
+        }
+        .accessibilityAction(named: "Connection Logs") {
+            showConnectionLogs = true
         }
     }
 
@@ -344,7 +357,7 @@ struct ServerDetailView: View {
                             .frame(width: 8, height: 8)
                             .accessibilityLabel("Running")
                     }
-                    Text(appNames[app.name] ?? app.name)
+                    Text(app.name)
                         .font(.headline)
                     if launchPaths[app.name] != nil {
                         Image(systemName: "link")

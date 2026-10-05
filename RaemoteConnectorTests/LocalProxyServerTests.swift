@@ -68,6 +68,48 @@ struct ProxyHTTPTests {
         #expect(String(decoding: head.head, as: UTF8.self).hasSuffix("\r\n\r\n"))
     }
 
+    // MARK: - gate secret stripping
+
+    @Test func rewriteStripsTheGateQueryFromThePath() throws {
+        let request = "GET /?raemote_auth=SECRET&token=abc HTTP/1.1\r\nHost: x\r\n\r\n"
+        let head = try #require(rewrite(request))
+        let text = String(decoding: head.head, as: UTF8.self)
+        #expect(text.hasPrefix("GET /app/app_name/?token=abc HTTP/1.1\r\n"))
+        #expect(!text.contains("raemote_auth"))
+        #expect(text.contains("token=abc"))
+    }
+
+    @Test func rewriteKeepsThePathWhenThereIsNoGateQuery() throws {
+        let head = try #require(rewrite("GET /?token=abc HTTP/1.1\r\nHost: x\r\n\r\n"))
+        #expect(String(decoding: head.head, as: UTF8.self)
+            .hasPrefix("GET /app/app_name/?token=abc HTTP/1.1\r\n"))
+    }
+
+    @Test func rewriteStripsTheGateQueryFromReferer() throws {
+        let request = "GET / HTTP/1.1\r\nHost: x\r\n"
+            + "Referer: http://127.0.0.1:5000/?\(ProxyAuth.queryItemName)=SECRET&x=1\r\n\r\n"
+        let head = try #require(rewrite(request))
+        let text = String(decoding: head.head, as: UTF8.self)
+        #expect(text.contains("Referer: http://127.0.0.1:5000/?x=1"))
+        #expect(!text.contains("raemote_auth"))
+    }
+
+    // MARK: - gate cookie bootstrap
+
+    @Test func injectsTheGateCookieAfterTheStatusLine() {
+        let response = Data("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".utf8)
+        let out = ProxyHTTP.injectingGateCookie(into: response, secret: "s3cret")
+        let text = String(decoding: out, as: UTF8.self)
+        #expect(text.hasPrefix("HTTP/1.1 200 OK\r\n"))
+        #expect(text.contains("Set-Cookie: \(ProxyAuth.cookieName)=s3cret; Path=/;"))
+        #expect(text.contains("Content-Length: 0\r\n\r\n"))
+    }
+
+    @Test func injectingIntoAHeadWithoutANewlineIsANoOp() {
+        let response = Data("HTTP/1.1 200 OK".utf8)
+        #expect(ProxyHTTP.injectingGateCookie(into: response, secret: "s") == response)
+    }
+
     // MARK: - error page substitution
 
     private func response(status: Int, reason: String, body: String) -> (Data, Data) {
@@ -110,28 +152,5 @@ struct ProxyHTTPTests {
         let text = String(decoding: page, as: UTF8.self)
         #expect(text.contains("&lt;the app&gt;"))
         #expect(text.contains("a &amp; b"))
-    }
-
-    /// Our error pages are marked in the response, so the web view can tell
-    /// them apart from the app's own pages without matching title text.
-    @Test func errorPageCarriesTheMarkerHeader() {
-        let page = ProxyHTTP.errorPage(
-            status: 504,
-            reason: "Gateway Timeout",
-            message: "The app didn't respond.",
-            hint: nil
-        )
-        let text = String(decoding: page, as: UTF8.self)
-        let head = text.components(separatedBy: "\r\n\r\n").first ?? ""
-        #expect(head.contains("\(ProxyHTTP.errorMarkerHeader): 1"))
-
-        // The JSON→HTML swap routes through the same builder, so it is marked
-        // too (it uses the server's own error message as the title).
-        let jsonBody = Data(#"{"error":"unknown app \"x\"","hint":"refresh"}"#.utf8)
-        let headBytes = Data("HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\n\r\n".utf8)
-        let swapped = ProxyHTTP.errorPageInsteadOfJSON(head: headBytes, body: jsonBody)
-        let swappedHead = String(decoding: swapped ?? Data(), as: UTF8.self)
-            .components(separatedBy: "\r\n\r\n").first ?? ""
-        #expect(swappedHead.contains("\(ProxyHTTP.errorMarkerHeader): 1"))
     }
 }

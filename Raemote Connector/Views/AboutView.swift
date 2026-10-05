@@ -38,6 +38,10 @@ struct AboutView: View {
                         Text("Make sure they're running on the computer and answer an HTTP request. On the server, run `raemote discover`, or add one by hand with `raemote apps add myserver 8080`.")
                     }
 
+                    section("Seeing a \"Not Secure\" warning?") {
+                        Text("Apps open in Safari's own viewer over a plain HTTP connection to your phone's loopback — the actual network hop is end-to-end encrypted by iroh, so nothing is exposed. Safari can still show its \"Not Secure Connection Warning\" page, because that's a Safari setting, not a problem with the connection. To stop it: Settings → Apps → Safari → Privacy & Security → turn off \"Not Secure Connection Warning\".")
+                    }
+
                     Divider()
 
                     Text(version)

@@ -26,14 +26,26 @@ command-line build and test.
 
 - Keeps a persistent device identity in the Keychain; pairs once, by QR code or
   link.
-- Opens each app in a `WKWebView` through an in-app loopback proxy with a stable
-  per-app origin, so logins and site data survive relaunches.
-- Shows whether the connection is direct or relayed, and can invite another
+- Opens each app in `SFSafariViewController` through an in-app loopback proxy
+  with a stable per-app origin, so logins and site data survive relaunches.
+  Open apps stay warm as background tabs — switching between them is instant
+  and keeps the page's state, and leaving one (Done) keeps it running.
+- Shows connection status, and can invite another
   device to the same server.
 
 It needs a server to be useful:
 [raemote/raemote_server](https://github.com/raemote/raemote_server) installs with
 one command.
+
+## Troubleshooting
+
+- **"Not Secure Connection Warning" page when opening an app** — Safari (which
+  renders apps in-app) can show a full-page HTTP warning for the loopback
+  origin. The connection itself is end-to-end encrypted by iroh; the warning is
+  a Safari setting, not a problem with Raemote. Turn it off in
+  *Settings → Apps → Safari → Privacy & Security → Not Secure Connection
+  Warning*. There is no in-app API to bypass it (`SFSafariViewController`
+  shares Safari's settings).
 
 ## Docs and license
 

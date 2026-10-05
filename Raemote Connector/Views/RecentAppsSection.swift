@@ -38,7 +38,7 @@ struct RecentAppsSection: View {
     private func chip(_ entry: RecentAppStore.Entry) -> some View {
         let key = entry.key
         let running = sessionManager.isRunning(key)
-        let name = AppNameStore.name(nodeId: key.nodeId, app: key.app) ?? key.app
+        let name = key.app
         let serverName = servers.first { $0.nodeId == key.nodeId }?.displayName
         return Button {
             onOpen(key)

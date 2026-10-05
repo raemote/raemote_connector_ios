@@ -1,5 +1,4 @@
 import Foundation
-import WebKit
 
 /// The secret gate in front of the loopback proxy.
 ///
@@ -7,25 +6,33 @@ import WebKit
 /// connect to `127.0.0.1:<port>` and would otherwise ride this app's
 /// authorized iroh tunnel to the paired server. The gate closes that: every
 /// request head must present this launch's 256-bit secret — as the
-/// `raemote_auth` cookie (what `WKWebsiteDataStore` carries automatically) or
-/// as the `X-Raemote-Session` header (what our own `URLSession` fetches send,
-/// since `URLSession` has a different cookie store than the web view) — and
-/// the tunnel answers 403 to anything else without opening an iroh stream.
+/// `raemote_auth` cookie, or as the `raemote_auth` query item on the launch
+/// URL — and the tunnel answers 403 to anything else without opening an iroh
+/// stream.
 ///
-/// The cookie is installed into `WKWebsiteDataStore.default()` **before** the
-/// first proxy URL loads, so the web view presents it from its very first
-/// request. Cookies are scoped by domain, not port: one secret covers every
-/// running session's port, which is exactly what we want (and why the secret
-/// is per *launch*, not per session — sessions come and go, the cookie stays).
+/// `SFSafariViewController` shares *Safari's* cookie store, which no API in
+/// this app can write to, so the cookie cannot be pre-installed the way the
+/// old `WKWebView` stack did. Instead the launch URL carries the secret; when
+/// the tunnel sees it, it answers with a `Set-Cookie` the browser retains for
+/// every later request (and strips the secret before it reaches the app).
+/// Cookies are scoped by domain, not port: one secret covers every running
+/// session's port, which is exactly what we want (and why the secret is per
+/// *launch*, not per session — sessions come and go, the cookie stays).
 nonisolated enum ProxyAuth {
-    /// Cookie the web view presents on every same-origin request.
+    /// Cookie the browser presents on every same-origin request once the
+    /// launch URL has bootstrapped it.
     static let cookieName = "raemote_auth"
-    /// Header our own `URLSession` requests present (`URLSession` does not
-    /// share the web view's cookie store).
-    static let headerName = "X-Raemote-Session"
+    /// Query item carrying the secret on the launch URL (same name, so the
+    /// bootstrap and the cookie read as one credential).
+    static let queryItemName = "raemote_auth"
+    /// How long the injected cookie lives. The secret rotates every launch, so
+    /// an old cookie simply fails the constant-time check; a fixed lifetime
+    /// just has to outlive a normal browsing session (session cookies may be
+    /// dropped when the Safari view controller goes away).
+    static let cookieMaxAgeSeconds = 30 * 24 * 60 * 60
 
-    /// 256 bits of hex, fresh for this launch; overwritten into the cookie
-    /// store before each session's first load.
+    /// 256 bits of hex, fresh for this launch; seeded into the browser's
+    /// cookie store by the first response to the launch URL.
     static let secret: String = {
         var rng = SystemRandomNumberGenerator()
         return (0..<32)
@@ -33,64 +40,81 @@ nonisolated enum ProxyAuth {
             .joined()
     }()
 
-    /// Put the secret into the web view's cookie store. Idempotent (same
-    /// value every call within a launch); must complete before the first
-    /// proxy URL is handed to the web view.
-    ///
-    /// `HttpOnly` is deliberately not set: `HTTPCookie` exposes no creation
-    /// key for it on iOS, and the threat it would mitigate (the remote page's
-    /// own JS reading the secret) is already inside the tunnel — the gate's
-    /// job is keeping *other apps on this phone* out, and they never receive
-    /// the cookie at all.
-    @MainActor
-    static func installCookie() async {
-        let store = WKWebsiteDataStore.default().httpCookieStore
-        let properties: [HTTPCookiePropertyKey: Any] = [
-            .name: cookieName,
-            .value: secret,
-            .path: "/",
-            .domain: "127.0.0.1",
-            .secure: "FALSE",
-        ]
-        guard let cookie = HTTPCookie(properties: properties) else { return }
-        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-            store.setCookie(cookie) { continuation.resume() }
-        }
+    /// How a request head presented the secret.
+    enum Match: Equatable, Sendable {
+        /// No usable credential — the request must be rejected.
+        case none
+        /// The `raemote_auth` cookie (later requests, once bootstrapped).
+        case cookie
+        /// The `raemote_auth` query item (the launch URL's first request).
+        case query
     }
 
-    /// Whether a raw request head carries the launch's secret.
-    static func isAuthorized(head: Data) -> Bool {
-        check(head: head, secret: secret)
-    }
-
-    /// Pure check over a raw HTTP request head: any presented credential
-    /// (cookie pair or header) that matches `secret` authorizes the request.
-    /// Compared in constant time; a failed comparison never short-circuits
-    /// the scan, and success is the only early return.
-    static func check(head: Data, secret: String) -> Bool {
-        guard let text = String(data: head, encoding: .utf8) else { return false }
+    /// Whether a raw request head carries the launch's secret, and how.
+    static func match(head: Data, secret: String) -> Match {
+        guard let text = String(data: head, encoding: .utf8) else { return .none }
         let lines = text.components(separatedBy: "\r\n")
+
+        // The request line: `GET /path?raemote_auth=… HTTP/1.1`.
+        if let requestLine = lines.first {
+            let parts = requestLine.split(separator: " ", maxSplits: 2)
+            if parts.count >= 2,
+               let presented = queryValue(named: queryItemName, inPath: String(parts[1])),
+               constantTimeEquals(presented, secret) {
+                return .query
+            }
+        }
+
         for line in lines.dropFirst() {
             guard let colon = line.firstIndex(of: ":") else { continue }
             let name = line[..<colon]
             let value = line[line.index(after: colon)...]
                 .trimmingCharacters(in: .whitespaces)
-            switch name.lowercased() {
-            case "cookie":
+            if name.lowercased() == "cookie" {
                 for pair in value.split(separator: ";") {
                     let kv = pair.split(separator: "=", maxSplits: 1)
                     guard kv.count == 2 else { continue }
                     let cookieNameFromWire = kv[0].trimmingCharacters(in: .whitespaces)
                     guard cookieNameFromWire == cookieName else { continue }
-                    if constantTimeEquals(String(kv[1]), secret) { return true }
+                    if constantTimeEquals(String(kv[1]), secret) { return .cookie }
                 }
-            case headerName.lowercased():
-                if constantTimeEquals(value, secret) { return true }
-            default:
-                break
             }
         }
-        return false
+        return .none
+    }
+
+    /// Whether a raw request head carries the launch's secret at all.
+    static func isAuthorized(head: Data) -> Bool {
+        match(head: head, secret: secret) != .none
+    }
+
+    /// The launch URL: `url` with the secret added as a query item (replacing
+    /// any stale one), so the browser's first request through a fresh session
+    /// bootstraps the cookie.
+    static func authorizedURL(_ url: URL) -> URL {
+        guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
+            return url
+        }
+        var items = components.queryItems ?? []
+        items.removeAll { $0.name == queryItemName }
+        items.append(URLQueryItem(name: queryItemName, value: secret))
+        components.queryItems = items
+        return components.url ?? url
+    }
+
+    /// The value of `name` in a request target's query (`/path?name=value`),
+    /// or `nil` when absent. Percent-decoded so a mangled encoding never
+    /// accidentally matches.
+    private static func queryValue(named name: String, inPath path: String) -> String? {
+        guard let q = path.firstIndex(of: "?") else { return nil }
+        let rest = path[path.index(after: q)...]
+        for pair in rest.split(separator: "&") {
+            let kv = pair.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
+            guard kv.count == 2, String(kv[0]) == name else { continue }
+            let raw = String(kv[1])
+            return raw.removingPercentEncoding ?? raw
+        }
+        return nil
     }
 
     /// Length-aware constant-time string comparison (the value is the secret;

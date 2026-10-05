@@ -17,8 +17,8 @@ struct DeepLinkTests {
         #expect(DeepLink(url: URL(string: "raemote://")!) == nil)
     }
 
-    @Test func roundTripsWithWebShare() throws {
-        let url = WebShare.raemoteURL(nodeId: "abc", appName: "jellyfin", path: "/web/a b")
+    @Test func roundTripsWithTheOpenURLBuilder() throws {
+        let url = DeepLink.openURL(nodeId: "abc", appName: "jellyfin", path: "/web/a b")
         let link = try #require(DeepLink(url: url))
         #expect(link.nodeId == "abc")
         #expect(link.appName == "jellyfin")

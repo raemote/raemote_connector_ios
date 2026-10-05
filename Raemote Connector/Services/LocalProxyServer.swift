@@ -3,12 +3,12 @@ import Network
 
 /// A tiny loopback HTTP/1.1 proxy.
 ///
-/// WKWebView is pointed at `http://127.0.0.1:<port>/`; every connection it makes
+/// SFSafariViewController is pointed at `http://127.0.0.1:<port>/`; every connection it makes
 /// is handled by a `ProxyTunnel`, which rewrites the path to `/app/<name><path>`
 /// and streams bytes both ways over iroh.
 ///
 /// This is what makes web apps reachable on a physical device: `127.0.0.1`
-/// inside WKWebView means this proxy, not the developer's machine.
+/// inside Safari means this proxy, not the developer's machine.
 ///
 /// Because iOS shares loopback across apps, the tunnel is gated: a request
 /// must present this launch's secret (`ProxyAuth`) or it is refused with a

@@ -23,20 +23,44 @@ struct RewrittenHead: Equatable {
 /// Pure HTTP helpers for the tunnel. Kept UIKit/Network-free so they can be
 /// unit-tested.
 nonisolated enum ProxyHTTP {
-    /// Response header set on error pages **we** generate (as opposed to the
-    /// app's own responses). The web view checks it so it never learns an app
-    /// name from our error page's `<title>` ("Couldn't reach the app.") — a
-    /// response property, so no title text ever needs to be compared.
-    static let errorMarkerHeader = "X-Raemote-Error"
-
     /// Index just past the head's terminating CRLF CRLF, if present.
     static func headEnd(in data: Data) -> Int? {
         data.range(of: Data("\r\n\r\n".utf8))?.upperBound
     }
 
+    /// Remove one query item from a request target or absolute URL, keeping
+    /// every other parameter byte-for-byte intact. The launch URL carries the
+    /// gate secret; it must never reach the app upstream.
+    static func stripQueryItem(_ name: String, from target: String) -> String {
+        guard let q = target.firstIndex(of: "?") else { return target }
+        let base = target[..<q]
+        let rest = target[target.index(after: q)...]
+        let kept = rest.split(separator: "&", omittingEmptySubsequences: false).filter { pair in
+            let kv = pair.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
+            guard let key = kv.first else { return true }
+            return String(key) != name
+        }
+        return kept.isEmpty ? String(base) : String(base) + "?" + kept.joined(separator: "&")
+    }
+
+    /// Insert a `Set-Cookie` for the gate secret just after the response's
+    /// status line, so the browser keeps presenting it on later requests.
+    static func injectingGateCookie(into responseHead: Data, secret: String) -> Data {
+        guard let newline = responseHead.range(of: Data("\r\n".utf8)) else { return responseHead }
+        let cookie = "Set-Cookie: \(ProxyAuth.cookieName)=\(secret); Path=/; "
+            + "Max-Age=\(ProxyAuth.cookieMaxAgeSeconds)\r\n"
+        var out = Data(responseHead.prefix(newline.lowerBound))
+        out.append(Data("\r\n".utf8))
+        out.append(Data(cookie.utf8))
+        out.append(Data(responseHead.suffix(from: newline.upperBound)))
+        return out
+    }
+
     /// Rewrite a request line `/x` → `/app/<name>/x` and fix connection
     /// semantics: upgraded (WebSocket) requests keep their upgrade, everything
     /// else is forced to `Connection: close` so the response is EOF-delimited.
+    /// The gate's query item is stripped from the path (and from `Referer`)
+    /// so the secret stops here.
     static func rewriteHead(_ head: Data, appName: String) -> RewrittenHead? {
         guard let text = String(data: head, encoding: .utf8) else { return nil }
         let lines = text.components(separatedBy: "\r\n")
@@ -47,7 +71,8 @@ nonisolated enum ProxyHTTP {
         let method = String(parts[0])
         let path = String(parts[1])
         let version = String(parts[2])
-        let mapped = "/app/\(appName)" + (path.hasPrefix("/") ? path : "/" + path)
+        let target = stripQueryItem(ProxyAuth.queryItemName, from: path)
+        let mapped = "/app/\(appName)" + (target.hasPrefix("/") ? target : "/" + target)
 
         var isUpgrade = false
         var contentLength: Int?
@@ -68,6 +93,10 @@ nonisolated enum ProxyHTTP {
                 contentLength = Int(value)
             case "transfer-encoding":
                 if value.lowercased().contains("chunked") { chunked = true }
+            case "referer":
+                // A same-origin `Referer` can include the launch URL's query.
+                headers.append("Referer: \(stripQueryItem(ProxyAuth.queryItemName, from: value))")
+                continue
             default:
                 break
             }
@@ -114,7 +143,7 @@ nonisolated enum ProxyHTTP {
         )
     }
 
-    /// A minimal, readable HTML error response for the web view.
+    /// A minimal, readable HTML error response for the browser.
     static func errorPage(status: Int, reason: String, message: String, hint: String?) -> Data {
         let hintHTML = hint.map { "<p class=\"hint\">\(escape($0))</p>" } ?? ""
         let html = """
@@ -139,7 +168,6 @@ nonisolated enum ProxyHTTP {
         let body = Data(html.utf8)
         let header = "HTTP/1.1 \(status) \(reason)\r\n"
             + "Content-Type: text/html; charset=utf-8\r\n"
-            + "\(errorMarkerHeader): 1\r\n"
             + "Content-Length: \(body.count)\r\n"
             + "Connection: close\r\n\r\n"
         var out = Data(header.utf8)
@@ -243,8 +271,11 @@ nonisolated final class ProxyTunnel: @unchecked Sendable {
 
         // Gate: iOS shares loopback across apps, so only requests presenting
         // this launch's secret may ride the authorized tunnel. Checked before
-        // any stream opens — a stranger never reaches the server.
-        guard ProxyAuth.isAuthorized(head: headData) else {
+        // any stream opens — a stranger never reaches the server. A match via
+        // the launch URL's query bootstraps the browser's cookie: every
+        // response to *this* request carries a `Set-Cookie`.
+        let match = ProxyAuth.match(head: headData, secret: ProxyAuth.secret)
+        guard match != .none else {
             print("[ProxyTunnel] rejected unauthorized request for \(appName)")
             await sendError(
                 status: 403,
@@ -254,6 +285,7 @@ nonisolated final class ProxyTunnel: @unchecked Sendable {
             )
             return
         }
+        let setCookie = match == .query
 
         guard let rewritten = ProxyHTTP.rewriteHead(headData, appName: appName) else {
             await sendError(status: 400, reason: "Bad Request", message: "The app request looked malformed.", hint: nil)
@@ -271,7 +303,7 @@ nonisolated final class ProxyTunnel: @unchecked Sendable {
                 print("[ProxyTunnel] retrying \(appName) on a fresh connection")
                 await service.invalidateConnection(nodeId: nodeId)
             }
-            switch await run(rewritten, rest) {
+            switch await run(rewritten, rest, setCookie: setCookie) {
             case .finished:
                 return
             case .noResponse where attempt + 1 < attempts:
@@ -281,7 +313,8 @@ nonisolated final class ProxyTunnel: @unchecked Sendable {
                     status: 504,
                     reason: "Gateway Timeout",
                     message: "The app didn't respond.",
-                    hint: "It may have just restarted — reload to try again."
+                    hint: "It may have just restarted — reload to try again.",
+                    setCookie: setCookie
                 )
                 return
             }
@@ -289,7 +322,7 @@ nonisolated final class ProxyTunnel: @unchecked Sendable {
     }
 
     /// One tunnel attempt: open a stream, replay the request, pump the response.
-    private func run(_ rewritten: RewrittenHead, _ rest: Data) async -> Outcome {
+    private func run(_ rewritten: RewrittenHead, _ rest: Data, setCookie: Bool) async -> Outcome {
         let stream: IrohService.RawStream
         do {
             stream = try await service.openStream(nodeId: nodeId)
@@ -299,7 +332,8 @@ nonisolated final class ProxyTunnel: @unchecked Sendable {
                 status: 502,
                 reason: "Bad Gateway",
                 message: "Couldn't reach the app.",
-                hint: "\(error)"
+                hint: "\(error)",
+                setCookie: setCookie
             )
             return .finished
         }
@@ -332,7 +366,7 @@ nonisolated final class ProxyTunnel: @unchecked Sendable {
             // Tunnel both directions until either side closes.
             await withTaskGroup(of: Void.self) { group in
                 group.addTask { await self.pumpToServer(send: stream.send, initial: rest) }
-                group.addTask { await self.pumpToClient(recv: stream.recv, watch: watch) }
+                group.addTask { await self.pumpToClient(recv: stream.recv, watch: watch, setCookie: setCookie) }
             }
         } else {
             // Upload the (possibly streamed) request body, then finish the send half.
@@ -344,7 +378,7 @@ nonisolated final class ProxyTunnel: @unchecked Sendable {
                 await service.streamFinished(nodeId: nodeId)
                 return .finished
             }
-            _ = await pumpToClient(recv: stream.recv, watch: watch)
+            _ = await pumpToClient(recv: stream.recv, watch: watch, setCookie: setCookie)
         }
 
         await service.streamFinished(nodeId: nodeId)
@@ -440,8 +474,10 @@ nonisolated final class ProxyTunnel: @unchecked Sendable {
         return data == Data("0\r\n\r\n".utf8)
     }
 
-    /// iroh → client until the stream ends.
-    private func pumpToClient(recv: RecvStream, watch: ResponseWatch) async {
+    /// iroh → client until the stream ends. `setCookie` bootstraps the gate
+    /// cookie on this response when the request authenticated via the launch
+    /// URL's query rather than the cookie.
+    private func pumpToClient(recv: RecvStream, watch: ResponseWatch, setCookie: Bool) async {
         // Peek the response head so our small JSON errors can be shown as HTML.
         var buffer = Data()
         while ProxyHTTP.headEnd(in: buffer) == nil {
@@ -462,10 +498,22 @@ nonisolated final class ProxyTunnel: @unchecked Sendable {
                head: Data(buffer.prefix(end)),
                body: Data(buffer.suffix(from: end))
            ) {
-            try? await connection.sendChunk(page)
+            let payload = setCookie
+                ? ProxyHTTP.injectingGateCookie(into: page, secret: ProxyAuth.secret)
+                : page
+            try? await connection.sendChunk(payload)
             await connection.finishSending()
             connection.cancel()
             return
+        }
+
+        if setCookie, let end = ProxyHTTP.headEnd(in: buffer) {
+            var head = ProxyHTTP.injectingGateCookie(
+                into: Data(buffer.prefix(end)),
+                secret: ProxyAuth.secret
+            )
+            head.append(Data(buffer.suffix(from: end)))
+            buffer = head
         }
 
         if !buffer.isEmpty {
@@ -523,8 +571,11 @@ nonisolated final class ProxyTunnel: @unchecked Sendable {
         try? await send.finish()
     }
 
-    private func sendError(status: Int, reason: String, message: String, hint: String?) async {
-        let page = ProxyHTTP.errorPage(status: status, reason: reason, message: message, hint: hint)
+    private func sendError(status: Int, reason: String, message: String, hint: String?, setCookie: Bool = false) async {
+        var page = ProxyHTTP.errorPage(status: status, reason: reason, message: message, hint: hint)
+        if setCookie {
+            page = ProxyHTTP.injectingGateCookie(into: page, secret: ProxyAuth.secret)
+        }
         try? await connection.sendChunk(page)
         await connection.finishSending()
         connection.cancel()

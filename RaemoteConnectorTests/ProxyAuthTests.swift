@@ -1,57 +1,68 @@
 import Testing
 import Foundation
-import WebKit
 @testable import Raemote_Connector
 
 struct ProxyAuthTests {
 
-    private func head(_ headers: [String]) -> Data {
-        Data((["GET / HTTP/1.1", "Host: 127.0.0.1:5000"] + headers + ["", ""])
+    private func head(requestLine: String = "GET / HTTP/1.1", _ headers: [String] = []) -> Data {
+        Data(([requestLine, "Host: 127.0.0.1:5000"] + headers + ["", ""])
             .joined(separator: "\r\n")
             .utf8)
     }
 
     private let secret = "a" * 64
 
-    // MARK: - check
+    // MARK: - match
 
     @Test func acceptsTheCookie() {
         let h = head(["Cookie: other=1; \(ProxyAuth.cookieName)=\(secret)"])
-        #expect(ProxyAuth.check(head: h, secret: secret))
+        #expect(ProxyAuth.match(head: h, secret: secret) == .cookie)
     }
 
-    @Test func acceptsTheHeader() {
-        let h = head(["\(ProxyAuth.headerName): \(secret)"])
-        #expect(ProxyAuth.check(head: h, secret: secret))
+    @Test func acceptsTheQuerySecretOnTheRequestLine() {
+        let h = head(requestLine: "GET /?raemote_auth=\(secret) HTTP/1.1")
+        #expect(ProxyAuth.match(head: h, secret: secret) == .query)
     }
 
-    @Test func headerNamesAreCaseInsensitive() {
-        let h = head(["cookie: \(ProxyAuth.cookieName)=\(secret)",
-                      "x-raemote-session: \(secret)"])
-        #expect(ProxyAuth.check(head: h, secret: secret))
+    @Test func acceptsTheQuerySecretAmongOtherParameters() {
+        let h = head(requestLine: "GET /some/path?token=xyz&raemote_auth=\(secret)&x=1 HTTP/1.1")
+        #expect(ProxyAuth.match(head: h, secret: secret) == .query)
+    }
+
+    @Test func cookieNamesAreCaseInsensitiveOnTheWire() {
+        let h = head(["cookie: \(ProxyAuth.cookieName)=\(secret)"])
+        #expect(ProxyAuth.match(head: h, secret: secret) == .cookie)
     }
 
     @Test func rejectsMissingCredentials() {
-        #expect(!ProxyAuth.check(head: head(["Cookie: session=abc"]), secret: secret))
-        #expect(!ProxyAuth.check(head: head([]), secret: secret))
+        #expect(ProxyAuth.match(head: head(["Cookie: session=abc"]), secret: secret) == .none)
+        #expect(ProxyAuth.match(head: head([]), secret: secret) == .none)
+        #expect(ProxyAuth.match(head: head(requestLine: "GET / HTTP/1.1"), secret: secret) == .none)
     }
 
     @Test func rejectsWrongValues() {
         let wrongCookie = head(["Cookie: \(ProxyAuth.cookieName)=\(String(repeating: "b", count: 64))"])
-        #expect(!ProxyAuth.check(head: wrongCookie, secret: secret))
+        #expect(ProxyAuth.match(head: wrongCookie, secret: secret) == .none)
 
-        let wrongHeader = head(["\(ProxyAuth.headerName): deadbeef"])
-        #expect(!ProxyAuth.check(head: wrongHeader, secret: secret))
+        let wrongQuery = head(requestLine: "GET /?raemote_auth=deadbeef HTTP/1.1")
+        #expect(ProxyAuth.match(head: wrongQuery, secret: secret) == .none)
 
         // Right value under a different cookie's name is still no.
         let otherName = head(["Cookie: raemote_other=\(secret)"])
-        #expect(!ProxyAuth.check(head: otherName, secret: secret))
+        #expect(ProxyAuth.match(head: otherName, secret: secret) == .none)
     }
 
     @Test func rejectsGarbageHeads() {
-        #expect(!ProxyAuth.check(head: Data("not http".utf8), secret: secret))
-        #expect(!ProxyAuth.check(head: Data(), secret: secret))
-        #expect(!ProxyAuth.check(head: Data([0xC3, 0x28, 0xA0, 0xA1]), secret: secret))
+        #expect(ProxyAuth.match(head: Data("not http".utf8), secret: secret) == .none)
+        #expect(ProxyAuth.match(head: Data(), secret: secret) == .none)
+        #expect(ProxyAuth.match(head: Data([0xC3, 0x28, 0xA0, 0xA1]), secret: secret) == .none)
+    }
+
+    @Test func isAuthorizedMirrorsMatchAgainstTheLaunchSecret() {
+        #expect(ProxyAuth.isAuthorized(head: head(["Cookie: \(ProxyAuth.cookieName)=\(ProxyAuth.secret)"])))
+        #expect(ProxyAuth.isAuthorized(head: head(requestLine: "GET /?raemote_auth=\(ProxyAuth.secret) HTTP/1.1")))
+        #expect(!ProxyAuth.isAuthorized(head: head([])))
+        #expect(!ProxyAuth.isAuthorized(head: head(requestLine: "GET /?raemote_auth=wrong HTTP/1.1")))
     }
 
     // MARK: - constant-time comparison
@@ -73,20 +84,28 @@ struct ProxyAuthTests {
         #expect(ProxyAuth.secret.allSatisfy { $0.isHexDigit })
     }
 
-    // MARK: - cookie installation
+    // MARK: - authorizedURL
 
-    @Test func installCookiePutsTheSecretInTheWebViewStore() async {
-        await ProxyAuth.installCookie()
-        let store = WKWebsiteDataStore.default().httpCookieStore
-        let cookies: [HTTPCookie] = await withCheckedContinuation { continuation in
-            store.getAllCookies { continuation.resume(returning: $0) }
-        }
-        let gate = cookies.first {
-            $0.name == ProxyAuth.cookieName && $0.domain == "127.0.0.1"
-        }
-        #expect(gate?.value == ProxyAuth.secret)
-        #expect(gate?.path == "/")
-        #expect(gate.map { $0.value.count } == 64)
+    @Test func authorizedURLAppendsTheSecret() throws {
+        let url = try #require(URL(string: "http://127.0.0.1:5000/?token=abc"))
+        let authorized = ProxyAuth.authorizedURL(url)
+        let items = URLComponents(url: authorized, resolvingAgainstBaseURL: false)?.queryItems
+        #expect(items?.first(where: { $0.name == "token" })?.value == "abc")
+        #expect(items?.first(where: { $0.name == ProxyAuth.queryItemName })?.value == ProxyAuth.secret)
+    }
+
+    @Test func authorizedURLReplacesAStaleSecret() throws {
+        let url = try #require(URL(string: "http://127.0.0.1:5000/?\(ProxyAuth.queryItemName)=old"))
+        let authorized = ProxyAuth.authorizedURL(url)
+        let items = URLComponents(url: authorized, resolvingAgainstBaseURL: false)?.queryItems ?? []
+        let secrets = items.filter { $0.name == ProxyAuth.queryItemName }
+        #expect(secrets.count == 1)
+        #expect(secrets.first?.value == ProxyAuth.secret)
+
+        // The URL this produces would authenticate as a query match.
+        let target = "/" + (authorized.query.map { "?\($0)" } ?? "")
+        let h = Data("GET \(target) HTTP/1.1\r\nHost: x\r\n\r\n".utf8)
+        #expect(ProxyAuth.match(head: h, secret: ProxyAuth.secret) == .query)
     }
 }
 

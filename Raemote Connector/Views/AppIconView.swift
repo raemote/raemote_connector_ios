@@ -2,7 +2,7 @@ import SwiftUI
 
 /// An app's icon: the cached favicon when available, else a monogram (the
 /// app's initial on a stable tint), drawn as a **circle** everywhere it
-/// appears (recent chips, the app list, the running-apps strip) so the app has
+/// appears (recent chips, the app list) so the app has
 /// one shape language.
 ///
 /// Loading is lazy — a row starts the fetch only when it appears, and

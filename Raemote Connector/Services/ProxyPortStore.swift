@@ -1,10 +1,11 @@
 import Foundation
 
-/// Remembers the loopback port used for each web app so its `WKWebView` origin
+/// Remembers the loopback port used for each web app so its browser origin
 /// (`http://127.0.0.1:<port>`) stays stable across launches.
 ///
 /// Site data — cookies, `localStorage`, IndexedDB, service workers — is scoped
-/// to the origin **including the port**, so a fresh ephemeral port every run
+/// to the origin **including the port** (and Safari's persistent store keeps it
+/// on that origin), so a fresh ephemeral port every run
 /// would silently reset the app (logins, settings, …) every time. Reusing the
 /// same port keeps the origin stable, and giving each app its own port keeps
 /// them isolated from one another.

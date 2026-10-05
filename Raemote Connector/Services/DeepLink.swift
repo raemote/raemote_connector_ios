@@ -5,9 +5,6 @@ import Foundation
 /// The `raemote` scheme is registered in `Info.plist` (`CFBundleURLTypes`), so
 /// iOS launches this app for a matching URL; `ContentView` handles it via
 /// `.onOpenURL`.
-///
-/// - Note: the scheme and its parameters are still a placeholder (produced by
-///   `WebShare.raemoteURL`); the exact shape may change.
 struct DeepLink: Equatable {
     /// The server (node id) the link points at.
     let nodeId: String?
@@ -15,6 +12,20 @@ struct DeepLink: Equatable {
     let appName: String?
     /// A path within the app.
     let path: String?
+
+    /// Build the canonical `raemote://open` URL this parser accepts (kept in
+    /// one place so the produced shape and the round-trip test can't drift).
+    static func openURL(nodeId: String, appName: String, path: String) -> URL {
+        var components = URLComponents()
+        components.scheme = "raemote"
+        components.host = "open"
+        components.queryItems = [
+            URLQueryItem(name: "node", value: nodeId),
+            URLQueryItem(name: "app", value: appName),
+            URLQueryItem(name: "path", value: path.isEmpty ? "/" : path),
+        ]
+        return components.url ?? URL(string: "raemote://open")!
+    }
 
     /// Parse a `raemote://` URL; returns `nil` for unrelated or empty URLs.
     init?(url: URL) {
