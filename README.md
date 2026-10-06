@@ -1,6 +1,6 @@
 # Raemote Connector (iOS)
 
-The iPhone/iPad client for [Raemote](https://github.com/raemote/raemote_server).
+The iPhone/iPad client for [Raemote](https://github.com/raemote/raemote_cli).
 It pairs with a Raemote server on your computer, lists the web apps that server
 finds, and opens them over an end-to-end encrypted
 [iroh](https://www.iroh.computer/) connection — from any network, with no port
@@ -34,7 +34,7 @@ command-line build and test.
   device to the same server.
 
 It needs a server to be useful:
-[raemote/raemote_server](https://github.com/raemote/raemote_server) installs with
+[raemote/raemote_cli](https://github.com/raemote/raemote_cli) installs with
 one command.
 
 ## Troubleshooting

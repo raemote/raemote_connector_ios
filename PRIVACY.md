@@ -69,5 +69,5 @@ Changes to this policy will be noted in the repository.
 ## Contact
 
 Questions or concerns: **cool@lyuhj.top**. The server's policy
-([`PRIVACY.md`](https://github.com/raemote/raemote_server/blob/main/PRIVACY.md))
+([`PRIVACY.md`](https://github.com/raemote/raemote_cli/blob/main/PRIVACY.md))
 covers the server side.

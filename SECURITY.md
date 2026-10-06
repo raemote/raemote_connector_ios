@@ -58,6 +58,6 @@ Out of scope:
 - an attacker who already controls your unlocked phone, or a jailbroken device.
 
 The trust model, and the server-side considerations, live in the server
-repository: [`docs/threat-model.md`](https://github.com/raemote/raemote_server/blob/main/docs/threat-model.md),
+repository: [`docs/threat-model.md`](https://github.com/raemote/raemote_cli/blob/main/docs/threat-model.md),
 with its own
-[`SECURITY.md`](https://github.com/raemote/raemote_server/blob/main/SECURITY.md).
+[`SECURITY.md`](https://github.com/raemote/raemote_cli/blob/main/SECURITY.md).

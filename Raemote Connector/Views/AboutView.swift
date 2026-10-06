@@ -48,7 +48,7 @@ struct AboutView: View {
                         .font(.footnote)
                         .foregroundStyle(.secondary)
 
-                    if let url = URL(string: "https://github.com/raemote/raemote_server") {
+                    if let url = URL(string: "https://github.com/raemote/raemote_cli") {
                         Link("Setup guide and documentation", destination: url)
                             .font(.footnote)
                     }
