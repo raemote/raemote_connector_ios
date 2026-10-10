@@ -186,4 +186,69 @@ struct WebAppTabRackTests {
 
         #expect(tab.view.frame == host.view.bounds)
     }
+
+    // MARK: - First-load state (the "stuck blank page" repro)
+
+    @Test func firstLoadStateTracksThePageLifecycle() {
+        let (rack, _) = makeRack()
+        let key = WebAppSessionKey(nodeId: "n", app: "a")
+
+        #expect(rack.loadState(for: key) == nil, "no page yet")
+        _ = rack.controller(for: key, url: url())
+        #expect(rack.loadState(for: key) == .loading, "a new tab starts loading")
+
+        rack.tabDidLoad(key, didLoad: true)
+        #expect(rack.loadState(for: key) == .loaded)
+
+        // A destroyed tab must not leave a load state behind for a later tab.
+        rack.destroy(for: key)
+        #expect(rack.loadState(for: key) == nil)
+    }
+
+    @Test func retryAfterAFailedLoadDropsTheTabSoItCanRebuild() {
+        let (rack, counter) = makeRack()
+        let key = WebAppSessionKey(nodeId: "n", app: "a")
+        _ = rack.controller(for: key, url: url())
+        rack.tabDidLoad(key, didLoad: false)
+        #expect(rack.loadState(for: key) == .failed)
+
+        // SFVC has no reload(): "Try Again" drops the controller so the next
+        // mount rebuilds it from the proxy URL.
+        rack.retryLoad(for: key)
+        #expect(rack.loadState(for: key) == nil)
+        #expect(!rack.hasController(for: key))
+        _ = rack.controller(for: key, url: url())
+        #expect(rack.loadState(for: key) == .loading, "the rebuilt page waits again")
+        #expect(counter.n == 2, "a fresh controller, not a stale one")
+    }
+
+    @Test func staleLoadCallbacksAreIgnored() {
+        let (rack, _) = makeRack()
+        let key = WebAppSessionKey(nodeId: "n", app: "a")
+        rack.tabDidLoad(key, didLoad: true) // no tab exists (closed, evicted)
+        #expect(rack.loadState(for: key) == nil)
+    }
+
+    // MARK: - Safari vs the connection gate
+
+    @Test func gateCoversEveryStateWhereThePageIsNotReachable() {
+        typealias P = AppPagePresentation
+        func resolve(_ proxyUp: Bool, _ connectionUp: Bool, _ loadState: TabLoadState?) -> P {
+            P.resolve(proxyUp: proxyUp, connectionUp: connectionUp, loadState: loadState)
+        }
+        // No proxy yet: nothing to show, whatever the connection says.
+        #expect(resolve(false, true, .loaded) == .waiting)
+        // Cold app while the connection is still coming up — the reported bug:
+        // a Safari view used to be created here and sat blank and unswipeable.
+        #expect(resolve(true, false, nil) == .waiting)
+        // A load in flight with no connection behind it will never finish.
+        #expect(resolve(true, false, .loading) == .waiting)
+        // Connected and loading (or not yet created): Safari may take over.
+        #expect(resolve(true, true, nil) == .showing)
+        #expect(resolve(true, true, .loading) == .showing)
+        // A finished page keeps showing — warm tabs outlive the connection.
+        #expect(resolve(true, false, .loaded) == .showing)
+        // A failed first load asks for a retry rather than a blank page.
+        #expect(resolve(true, true, .failed) == .failed)
+    }
 }

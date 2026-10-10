@@ -11,6 +11,13 @@ import SwiftUI
 /// owns its chrome (back/forward/reload/share), this screen only supplies
 /// what Safari can't: waiting for a live iroh connection, starting the
 /// proxy, and treating Done as "leave the app".
+///
+/// Safari is shown only once the page can actually load
+/// (`AppPagePresentation`): before that — and while a load is stuck because
+/// the connection dropped — the connection gate owns the screen, so there is
+/// never a blank browser view sitting on a dead tunnel. The gate always offers
+/// a way out, and the edge-swipe is re-enabled for the loaded case, so leaving
+/// never depends on a page having rendered.
 struct AppHostView: View {
     let sessionManager: WebAppSessionManager
     let irohService: IrohService
@@ -39,25 +46,29 @@ struct AppHostView: View {
     }
 
     private func content(key: WebAppSessionKey, session: WebAppSession) -> some View {
-        ZStack {
+        let presentation = pagePresentation(key: key, session: session)
+        let showing = presentation == .showing
+        // Explicit `return`: multi-statement bodies can't infer an opaque type.
+        return ZStack {
             // One identity for the whole screen (no `.id(key)`): switching the
             // active key only re-mounts the rack with a different visible tab,
             // which is what makes a switch instant and state-preserving. The
-            // mount creates the tab from `activeURL` once the proxy is up (and
-            // self-heals a memory-evicted page on re-present).
+            // mount creates the tab from `activeURL` once the page can actually
+            // load (and self-heals a memory-evicted page on re-present).
             RackMountView(
                 rack: sessionManager.rack,
-                activeKey: key,
-                activeURL: session.proxyURL,
+                activeKey: showing ? key : nil,
+                activeURL: showing ? session.proxyURL : nil,
                 // Done on the active tab: leave the screen; the session (and
                 // every warm tab) keeps running.
                 onFinish: { dismiss() }
             )
-            // The rack hides every tab until this session's proxy is listening,
-            // so a cold app shows the gate over an empty rack instead of a
-            // failing origin.
-            if session.proxyURL == nil {
-                connectionGate(key: key, session: session)
+            // While we are still waiting, the rack shows **nothing**: no blank
+            // Safari view to stare at, no load parked on a tunnel with no server
+            // behind it, and no page that swallows the edge-swipe. Warm tabs
+            // keep running off-screen and reappear the moment they can.
+            if !showing {
+                connectionGate(key: key, session: session, presentation: presentation)
             }
         }
         // Our navigation chrome would only compete with Safari's own bar.
@@ -94,12 +105,33 @@ struct AppHostView: View {
 
     // MARK: - Connection gate
 
+    /// Safari or the gate? Safari owns the screen only when its page is
+    /// actually reachable — see `AppPagePresentation`.
+    private func pagePresentation(key: WebAppSessionKey, session: WebAppSession) -> AppPagePresentation {
+        AppPagePresentation.resolve(
+            proxyUp: session.proxyURL != nil,
+            connectionUp: isConnected(key),
+            loadState: sessionManager.rack.loadState(for: key)
+        )
+    }
+
+    private func isConnected(_ key: WebAppSessionKey) -> Bool {
+        if case .connected = connectionState(for: key) { return true }
+        return false
+    }
+
     @ViewBuilder
-    private func connectionGate(key: WebAppSessionKey, session: WebAppSession) -> some View {
+    private func connectionGate(
+        key: WebAppSessionKey,
+        session: WebAppSession,
+        presentation: AppPagePresentation
+    ) -> some View {
         VStack(spacing: 12) {
-            ProgressView()
-                .controlSize(.large)
-            Text("Connecting to server…")
+            if presentation != .failed {
+                ProgressView()
+                    .controlSize(.large)
+            }
+            Text(presentation == .failed ? "This app didn’t load" : "Connecting to server…")
                 .font(.headline)
             if let proxyError {
                 Text(proxyError)
@@ -107,10 +139,12 @@ struct AppHostView: View {
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
                     .padding(.horizontal, 40)
-                Button("Try Again") {
-                    Task { await connectThenStart(key: key, session: session) }
-                }
-                .buttonStyle(.bordered)
+            } else if presentation == .failed {
+                Text("The page could not be loaded from the server. Your other apps and logins are untouched.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 40)
             } else if case .disconnected(let reason) = connectionState(for: key),
                       let reason, !reason.isEmpty {
                 Text(reason)
@@ -119,6 +153,23 @@ struct AppHostView: View {
                     .multilineTextAlignment(.center)
                     .padding(.horizontal, 40)
             }
+            HStack(spacing: 12) {
+                // The gate is the screen's way out even if a gesture is ever
+                // swallowed — waiting is the moment the user most wants to leave.
+                Button("Back") { dismiss() }
+                    .buttonStyle(.bordered)
+                if proxyError != nil || presentation == .failed {
+                    Button("Try Again") {
+                        if presentation == .failed {
+                            sessionManager.rack.retryLoad(for: key)
+                        } else {
+                            Task { await connectThenStart(key: key, session: session) }
+                        }
+                    }
+                    .buttonStyle(.borderedProminent)
+                }
+            }
+            .padding(.top, 4)
         }
     }
 

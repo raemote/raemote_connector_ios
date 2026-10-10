@@ -1,6 +1,56 @@
+import Observation
 import SafariServices
 import SwiftUI
 import UIKit
+
+/// Whether a tab's page has finished its **first** load.
+///
+/// `loading` is the window in which a page can look alive and still be
+/// unreachable: the request is parked on a tunnel that has no server behind it,
+/// and a pending stream read can't be interrupted. The app screen keys its
+/// connection gate off this, so a page that never loads is shown as "connecting"
+/// rather than as a blank Safari view the user can't swipe away from.
+enum TabLoadState: Equatable, Sendable {
+    case loading
+    case loaded
+    case failed
+}
+
+/// What the app screen shows for the active app.
+///
+/// Pure so the rule is unit-testable: Safari's page is shown only when it is
+/// actually reachable — its first load finished, or it is loading while the
+/// server connection is up. Everything else keeps the connection gate (with a
+/// way out) on screen instead of a blank, unswipeable browser.
+enum AppPagePresentation: Equatable, Sendable {
+    /// Show the warm tab, creating it from the proxy URL if needed.
+    case showing
+    /// No usable page yet: show the gate.
+    case waiting
+    /// The first load failed: show the gate with a retry.
+    case failed
+
+    /// A static function rather than an `init`: it is a decision, not a value
+    /// that builds the presentation.
+    static func resolve(
+        proxyUp: Bool,
+        connectionUp: Bool,
+        loadState: TabLoadState?
+    ) -> AppPagePresentation {
+        guard proxyUp else { return .waiting }
+        switch loadState {
+        case .loaded:
+            return .showing
+        case .failed:
+            return .failed
+        case .loading, .none:
+            // A cold app must not create its Safari view before the connection
+            // is usable; a warm one that is mid-load keeps showing while the
+            // connection holds, and falls back to the gate when it drops.
+            return connectionUp ? .showing : .waiting
+        }
+    }
+}
 
 /// The warm multi-app "tab rack": one retained view controller per live
 /// session, kept alive **off-window** so background apps keep running like
@@ -22,6 +72,7 @@ import UIKit
 /// The factory is injectable so tests exercise the lifecycle with plain
 /// view controllers instead of spinning up real `SFSafariViewController`s.
 @MainActor
+@Observable
 final class WebAppTabRack {
     /// Builds the per-URL tab controller (defaults to `SFSafariViewController`).
     typealias Factory = (URL) -> UIViewController
@@ -30,6 +81,9 @@ final class WebAppTabRack {
     private let rackVC = UIViewController()
     private var controllers: [WebAppSessionKey: UIViewController] = [:]
     private var delegates: [WebAppSessionKey: RackTabDelegate] = [:]
+    /// First-load state per tab; the app screen reads it to decide between
+    /// Safari and the connection gate.
+    private(set) var loadStates: [WebAppSessionKey: TabLoadState] = [:]
     private let factory: Factory
 
     /// The tab whose page is currently visible (the mounted one).
@@ -70,12 +124,29 @@ final class WebAppTabRack {
         vc.didMove(toParent: rackVC)
         // Hidden until it is (or becomes) the active tab.
         vc.view.isHidden = true
+        // A fresh controller starts a load; the app screen waits on this
+        // before letting Safari own the screen.
+        loadStates[key] = .loading
         if let safari = vc as? SFSafariViewController {
             let delegate = RackTabDelegate(rack: self, key: key)
             safari.delegate = delegate
             delegates[key] = delegate
         }
         return vc
+    }
+
+    /// The tab's first-load state, or `nil` when it has no page yet.
+    func loadState(for key: WebAppSessionKey) -> TabLoadState? {
+        loadStates[key]
+    }
+
+    /// Retry a tab whose first load failed. `SFSafariViewController` has no
+    /// `reload()`, so the controller is dropped and rebuilt from the proxy URL
+    /// by the next mount — the same self-healing path a memory-evicted page
+    /// takes. Airtight: the warm-tab machinery never sees a half-torn tab.
+    func retryLoad(for key: WebAppSessionKey) {
+        guard controllers[key] != nil else { return }
+        destroy(for: key)
     }
 
     func hasController(for key: WebAppSessionKey) -> Bool {
@@ -92,6 +163,7 @@ final class WebAppTabRack {
     func destroy(for key: WebAppSessionKey) {
         guard let vc = controllers.removeValue(forKey: key) else { return }
         delegates.removeValue(forKey: key)
+        loadStates.removeValue(forKey: key)
         vc.willMove(toParent: nil)
         vc.view.removeFromSuperview()
         vc.removeFromParent()
@@ -167,6 +239,13 @@ final class WebAppTabRack {
         guard activeKey == key, let onFinish else { return }
         onFinish()
     }
+
+    /// A tab's first load finished (or failed). The page still belongs to this
+    /// tab only — a stale callback from a destroyed tab is ignored.
+    func tabDidLoad(_ key: WebAppSessionKey, didLoad: Bool) {
+        guard controllers[key] != nil else { return }
+        loadStates[key] = didLoad ? .loaded : .failed
+    }
 }
 
 /// Per-tab `SFSafariViewController` delegate; holds the rack weakly (the rack
@@ -182,6 +261,38 @@ private final class RackTabDelegate: NSObject, SFSafariViewControllerDelegate {
 
     func safariViewControllerDidFinish(_ controller: SFSafariViewController) {
         rack?.tabDidFinish(key)
+    }
+
+    func safariViewController(_ controller: SFSafariViewController, didCompleteInitialLoad didLoad: Bool) {
+        rack?.tabDidLoad(key, didLoad: didLoad)
+    }
+}
+
+/// The screen's host controller.
+///
+/// Its one job beyond hosting the rack: keep the navigation controller's
+/// edge-swipe (interactive pop) alive. SwiftUI disables it when the back button
+/// is hidden (`.navigationBarBackButtonHidden(true)`), and a Safari view that
+/// is still loading can swallow the edge pan anyway — together those leave a
+/// user staring at a page that never loads with no way back. Re-enabling it
+/// here means the swipe always leaves the app, page or no page.
+final class RackHostController: UIViewController {
+    override func viewWillAppear(_ animated: Bool) {
+        super.viewWillAppear(animated)
+        enableEdgeSwipe()
+    }
+
+    override func didMove(toParent parent: UIViewController?) {
+        super.didMove(toParent: parent)
+        enableEdgeSwipe()
+    }
+
+    private func enableEdgeSwipe() {
+        guard let pop = navigationController?.interactivePopGestureRecognizer else { return }
+        pop.isEnabled = true
+        // The navigation controller's own delegate suppresses the gesture when
+        // there is no visible back button; with no delegate it always begins.
+        pop.delegate = nil
     }
 }
 
@@ -199,7 +310,7 @@ struct RackMountView: UIViewControllerRepresentable {
     }
 
     func makeUIViewController(context: Context) -> UIViewController {
-        UIViewController()
+        RackHostController()
     }
 
     func updateUIViewController(_ host: UIViewController, context: Context) {
