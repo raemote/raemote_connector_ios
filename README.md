@@ -44,8 +44,7 @@ one command.
   origin. The connection itself is end-to-end encrypted by iroh; the warning is
   a Safari setting, not a problem with Raemote. Turn it off in
   *Settings → Apps → Safari → Privacy & Security → Not Secure Connection
-  Warning*. There is no in-app API to bypass it (`SFSafariViewController`
-  shares Safari's settings).
+  Warning*.
 
 ## Docs and license
 
