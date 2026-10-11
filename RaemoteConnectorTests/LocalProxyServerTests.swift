@@ -1,5 +1,6 @@
 import Testing
 import Foundation
+import Network
 @testable import Raemote_Connector
 
 struct ProxyHTTPTests {
@@ -152,5 +153,83 @@ struct ProxyHTTPTests {
         let text = String(decoding: page, as: UTF8.self)
         #expect(text.contains("&lt;the app&gt;"))
         #expect(text.contains("a &amp; b"))
+    }
+}
+
+/// Regression cover for the loopback proxy's tunnel registry.
+///
+/// TestFlight build 8 died on iPad with `EXC_BAD_ACCESS` inside
+/// `Dictionary.removeValue(forKey:)`: a tunnel's pump ended on a Swift
+/// cooperative thread and untracked itself there, while the listener queue was
+/// tracking a new connection or tearing everything down — two threads mutating
+/// `tunnels` at once, one of them freeing the storage the other was refcounting.
+/// The fix routes both registry mutations through the owning queue.
+///
+/// The crash was a race, so the test that guards it must be run under Thread
+/// Sanitizer to mean anything:
+/// `xcodebuild test -enableThreadSanitizer YES …`
+@MainActor
+struct LocalProxyServerRegistryTests {
+
+    private func makeServer() -> LocalProxyServer {
+        LocalProxyServer(
+            nodeId: "server-a",
+            appName: "jellyfin",
+            // Never dialled: the gate rejects these requests before any iroh
+            // stream opens, so this is just a cheap, unconnected service.
+            service: IrohService(monitor: IrohConnectionMonitor())
+        )
+    }
+
+    @Test func pumpsEndingWhileConnectionsArriveDoNotCorruptTheRegistry() async throws {
+        let server = makeServer()
+        let port = try await server.start()
+        let endpoint = NWEndpoint.Host.ipv4(.loopback)
+        let clients = DispatchQueue(label: "test.clients")
+
+        // Accept-and-abandon, round after round. The part that matters is
+        // cancelling *inside* the loop: each pump then unwinds — untracking
+        // itself on a cooperative thread — while later rounds are still being
+        // tracked on the listener queue. That unordered pair is what build 8
+        // lost, one thread freeing the dictionary storage the other was
+        // refcounting. Leaving them all open until the end would not reproduce
+        // it: the teardown happens-before every unwind.
+        var stillOpen: [NWConnection] = []
+        var sawTracked = false
+        for i in 0..<60 {
+            let client = NWConnection(
+                host: endpoint,
+                port: NWEndpoint.Port(rawValue: port)!,
+                using: .tcp
+            )
+            client.start(queue: clients)
+            try await Task.sleep(for: .milliseconds(2))
+            if i < 10 { stillOpen.append(client) } else { client.cancel() }
+            if !sawTracked { sawTracked = server.trackedTunnelCount > 0 }
+        }
+        #expect(sawTracked, "connections should have been tracked while pumping")
+
+        // Teardown then overlaps with whatever is still ending: `stop()` cancels
+        // every tracked connection on the queue while their pumps unwind.
+        server.stop()
+        stillOpen.forEach { $0.cancel() }
+
+        // And the fence holds: nothing is left tracked once every pump ended.
+        var tracked = server.trackedTunnelCount
+        for _ in 0..<100 where tracked > 0 {
+            try await Task.sleep(for: .milliseconds(20))
+            tracked = server.trackedTunnelCount
+        }
+        #expect(tracked == 0)
+    }
+
+    @Test func stopIsSafeWithNoConnectionsAndRepeatable() async throws {
+        let server = makeServer()
+        _ = try await server.start()
+        server.stop()
+        // Idempotent: closing twice (close() plus an eviction fence) must not
+        // wedge the registry or double-release anything.
+        server.stop()
+        #expect(server.trackedTunnelCount == 0)
     }
 }

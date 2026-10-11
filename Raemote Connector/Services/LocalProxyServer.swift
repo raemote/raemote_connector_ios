@@ -57,7 +57,10 @@ nonisolated final class LocalProxyServer: @unchecked Sendable {
         let endpointPort: NWEndpoint.Port = port.flatMap { NWEndpoint.Port(rawValue: $0) } ?? .any
         params.requiredLocalEndpoint = NWEndpoint.hostPort(host: "127.0.0.1", port: endpointPort)
         let listener = try NWListener(using: params)
-        self.listener = listener
+        // Publish on `queue`, which owns `listener`: `stop()` can tear the
+        // listener down there while this start is still in flight. Assigning
+        // here (off-queue) was the same class of race as `tunnels`.
+        queue.sync { self.listener = listener }
 
         return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<UInt16, Error>) in
             // The state handler is a Sendable closure that Network.framework may
@@ -106,7 +109,7 @@ nonisolated final class LocalProxyServer: @unchecked Sendable {
 
     private func handle(_ connection: NWConnection) {
         // Track the tunnel so stop() can end it deterministically.
-        queue.async(execute: { self.track(connection) })
+        track(connection)
         connection.start(queue: queue)
         let tunnel = ProxyTunnel(connection: connection, appName: appName, service: service, nodeId: nodeId)
         Task.detached { [weak self] in
@@ -117,14 +120,26 @@ nonisolated final class LocalProxyServer: @unchecked Sendable {
         }
     }
 
-    /// Runs on `queue`.
+    /// Adds to the tunnel registry. Callable from **any** thread — the hop to
+    /// `queue` lives here, so no call site can mutate `tunnels` off-queue.
     private func track(_ connection: NWConnection) {
-        tunnels[ObjectIdentifier(connection)] = connection
+        let key = ObjectIdentifier(connection)
+        queue.async { self.tunnels[key] = connection }
     }
 
-    /// Runs on `queue`.
+    /// Drops a tunnel from the registry. Callable from **any** thread: a pump
+    /// ends on a Swift cooperative thread, and mutating `tunnels` from there
+    /// raced the listener/teardown path on `queue` — a real SIGSEGV inside
+    /// `Dictionary.removeValue` (TestFlight build 8, iPad, 2026-10-11).
     private func untrack(_ connection: NWConnection) {
-        tunnels.removeValue(forKey: ObjectIdentifier(connection))
+        let key = ObjectIdentifier(connection)
+        queue.async { self.tunnels.removeValue(forKey: key) }
+    }
+
+    /// Live tunnels currently tracked. Test hook: also asserts the registry
+    /// drains to zero once every pump has ended.
+    var trackedTunnelCount: Int {
+        queue.sync { tunnels.count }
     }
 }
 
