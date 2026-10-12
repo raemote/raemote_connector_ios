@@ -753,12 +753,41 @@ actor IrohService {
     }
 
     /// Mint a one-time invitation so another device can pair with this server.
-    func createInvitation(nodeId: String? = nil) async throws -> Invitation {
-        let (status, body) = try await httpRequest(method: "POST", path: "/_hub/invite", nodeId: nodeId)
+    ///
+    /// `ports` narrows the invitation to apps on exactly those ports; the
+    /// server re-checks the list against *this* device's own scope and
+    /// answers `400 beyond_grant` for anything wider — an invitation can
+    /// never grant more than the inviter has. `nil` sends no body at all,
+    /// which the server reads as "grant the invited device whatever this
+    /// device has" (the classic, inherit-everything link).
+    func createInvitation(nodeId: String? = nil, ports: [UInt16]? = nil) async throws -> Invitation {
+        let body = try ports.map { try InviteAccess.requestBody(ports: $0) }
+        let (status, responseBody) = try await httpRequest(
+            method: "POST",
+            path: "/_hub/invite",
+            nodeId: nodeId,
+            body: body
+        )
+        guard status == 200 else {
+            throw IrohError.http(status: status, body: responseBody)
+        }
+        return try JSONDecoder().decode(Invitation.self, from: responseBody)
+    }
+
+    /// Fetch this device's own access scope from `GET /_hub/info`.
+    ///
+    /// Returns `nil` when the server doesn't report it (a version that
+    /// predates per-device scopes) or reports it in an unreadable shape —
+    /// both mean "no restriction known", which the invite flow maps to the
+    /// inherit-only behavior so it can never *claim* a narrowing an old
+    /// server would silently ignore.
+    func fetchDeviceAccess(nodeId: String? = nil) async throws -> DeviceAccess? {
+        let (status, body) = try await httpRequest(method: "GET", path: "/_hub/info", nodeId: nodeId)
         guard status == 200 else {
             throw IrohError.http(status: status, body: body)
         }
-        return try JSONDecoder().decode(Invitation.self, from: body)
+        struct Info: Decodable { let access: DeviceAccess? }
+        return (try? JSONDecoder().decode(Info.self, from: body))?.access ?? nil
     }
 
     // MARK: - Device name

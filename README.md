@@ -31,7 +31,8 @@ command-line build and test.
   Open apps stay warm as background tabs — switching between them is instant
   and keeps the page's state, and leaving one (Done) keeps it running.
 - Shows connection status, and can invite another
-  device to the same server.
+  device to the same server — choosing up front whether they get exactly
+  this device's access or only the apps you pick.
 
 It needs a server to be useful:
 [raemote/raemote_cli](https://github.com/raemote/raemote_cli) installs with

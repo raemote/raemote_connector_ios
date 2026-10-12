@@ -30,6 +30,15 @@ struct ServerDetailView: View {
     @State private var launchPrompt: AppInfo?
     @State private var launchText = ""
     @State private var invitation: InvitationPresentation?
+    /// The invite sheet (the access picker, then the minted QR — the sheet's
+    /// content swaps in place once `invitation` is set).
+    @State private var showInviteSheet = false
+    /// This device's reported scope for the access picker (`nil` on servers
+    /// that predate per-device scopes — then the picker never shows).
+    @State private var deviceAccess: DeviceAccess?
+    /// Mint failure shown *inside* the access picker (the sheet covers the
+    /// screen, so the root view's alert would not be visible).
+    @State private var inviteError: String?
     /// The hidden connection-diagnosis modal (long-press the Connection row).
     @State private var showConnectionLogs = false
 
@@ -111,7 +120,7 @@ struct ServerDetailView: View {
                     Divider()
 
                     Button("Invite Device…", systemImage: "person.badge.plus") {
-                        Task { await createInvitation() }
+                        Task { await prepareInvite() }
                     }
                     .disabled(isCreatingInvitation || isRefreshing)
                 } label: {
@@ -166,12 +175,35 @@ struct ServerDetailView: View {
                 Text(refreshError)
             }
         }
-        .sheet(item: $invitation) { invitation in
-            InviteDeviceView(
-                serverName: displayTitle,
-                uri: invitation.uri,
-                expiresAt: invitation.expiresAt
-            )
+        .sheet(isPresented: $showInviteSheet) {
+            if let invitation {
+                InviteDeviceView(
+                    serverName: displayTitle,
+                    uri: invitation.uri,
+                    expiresAt: invitation.expiresAt
+                )
+            } else {
+                InviteAccessView(
+                    apps: apps,
+                    access: deviceAccess,
+                    nodeId: server.nodeId,
+                    irohService: irohService,
+                    isMinting: isCreatingInvitation,
+                    errorMessage: inviteError,
+                    onCreate: { ports in
+                        Task { await mintInvitation(ports: ports, inSheet: true) }
+                    }
+                )
+            }
+        }
+        .onChange(of: showInviteSheet) { _, shown in
+            // A dismissed sheet must not leak a stale QR (or scope) into the
+            // next invitation.
+            if !shown {
+                invitation = nil
+                deviceAccess = nil
+                inviteError = nil
+            }
         }
         .sheet(isPresented: $showConnectionLogs) {
             ConnectionLogView(nodeId: server.nodeId, title: displayTitle, monitor: monitor)
@@ -210,12 +242,15 @@ struct ServerDetailView: View {
         onReportedName(info.name)
     }
 
-    /// Mint a one-time invitation and present it as a QR/link sheet.
+    /// Prepare an invitation: connect, read this device's access scope, and
+    /// decide whether the inviter has a choice to make.
     ///
-    /// Can take a few seconds — it may reconnect first and then round-trips to
-    /// the server — so it runs behind `isCreatingInvitation`, which disables the
-    /// menu item and spins the toolbar icon.
-    private func createInvitation() async {
+    /// The access picker only appears when choosing would matter — this
+    /// device reported a scope with at least two ports and there are apps to
+    /// pick from. Otherwise the classic inherit-everything link is minted
+    /// directly, exactly as before. Runs behind `isCreatingInvitation`, which
+    /// disables the menu item and spins the toolbar icon.
+    private func prepareInvite() async {
         guard !isCreatingInvitation else { return }
         isCreatingInvitation = true
         defer { isCreatingInvitation = false }
@@ -225,14 +260,64 @@ struct ServerDetailView: View {
             refreshError = "Not connected to the server. Try again once it reconnects."
             return
         }
+
+        // `nil` on a server that predates per-device scopes — such a server
+        // would silently ignore a narrowed invitation, so we must not offer
+        // one. A fetch failure is treated the same way (no picker, no claim).
+        let access = try? await irohService.fetchDeviceAccess(nodeId: server.nodeId)
+        deviceAccess = access
+        inviteError = nil
+
+        if InviteAccess.shouldOfferChoice(access: access, apps: apps) {
+            showInviteSheet = true
+        } else {
+            invitation = nil
+            // Release the flag: mintInvitation guards on it (the `defer`
+            // below re-clears it, which is a no-op).
+            isCreatingInvitation = false
+            if await mintInvitation(ports: nil, inSheet: false) {
+                showInviteSheet = true
+            }
+        }
+    }
+
+    /// Mint a one-time invitation and present it as a QR/link sheet.
+    ///
+    /// `ports` narrows the grant (`nil` inherits this device's access);
+    /// `inSheet` decides where a failure surfaces — inside the access picker,
+    /// which covers the screen, or the root view's alert on the direct path.
+    /// Can take a few seconds, so it runs behind `isCreatingInvitation`.
+    private func mintInvitation(ports: [UInt16]?, inSheet: Bool) async -> Bool {
+        guard !isCreatingInvitation else { return false }
+        isCreatingInvitation = true
+        defer { isCreatingInvitation = false }
+
+        func fail(_ message: String) -> Bool {
+            if inSheet {
+                inviteError = message
+            } else {
+                refreshError = message
+            }
+            return false
+        }
+
+        if inSheet { inviteError = nil }
+        await irohService.validateConnection(nodeId: server.nodeId)
+        guard case .connected = connectionState else {
+            return fail("Not connected to the server. Try again once it reconnects.")
+        }
         do {
-            let invite = try await irohService.createInvitation(nodeId: server.nodeId)
+            let invite = try await irohService.createInvitation(
+                nodeId: server.nodeId,
+                ports: ports
+            )
             invitation = InvitationPresentation(
                 uri: invite.uri,
                 expiresAt: Date(timeIntervalSince1970: TimeInterval(invite.expiresAtUnix))
             )
+            return true
         } catch {
-            refreshError = error.localizedDescription
+            return fail(InviteAccess.mintErrorMessage(error))
         }
     }
 
