@@ -39,8 +39,15 @@ struct ServerDetailView: View {
     /// Mint failure shown *inside* the access picker (the sheet covers the
     /// screen, so the root view's alert would not be visible).
     @State private var inviteError: String?
-    /// The hidden connection-diagnosis modal (long-press the Connection row).
+    /// The hidden connection-diagnosis modal (long-press the status line, or
+    /// the "…" menu's Connection Logs item).
     @State private var showConnectionLogs = false
+    /// The "Server Info…" sheet — the full node id lives there, not on the
+    /// main screen.
+    @State private var showServerInfo = false
+
+    /// Tile grid columns: narrow phones get two columns, wide screens more.
+    private let appColumns = [GridItem(.adaptive(minimum: 104), spacing: 14)]
 
     /// A minted invitation presented in a sheet.
     private struct InvitationPresentation: Identifiable {
@@ -77,32 +84,36 @@ struct ServerDetailView: View {
 
     var body: some View {
         List {
-            Section("Info") {
-                LabeledContent("Name", value: displayTitle)
-                LabeledContent("Node ID", value: server.nodeId.prefix(16) + "...")
-                LabeledContent("Apps", value: "\(apps.count)")
-                connectionRow
+            Section {
+                statusLine
+                    .listRowBackground(Color.clear)
+                    .listRowSeparator(.hidden)
+                    .listRowInsets(EdgeInsets(top: 6, leading: 16, bottom: 2, trailing: 16))
             }
 
-            Section("Apps") {
+            Section {
                 if apps.isEmpty {
-                    ContentUnavailableView(
-                        "No Apps",
-                        systemImage: "app.badge",
-                        description: Text("Tap refresh to scan for local apps. If none appear, make sure they're running on the computer.")
-                    )
-                } else {
-                    ForEach(apps) { app in
-                        Button {
-                            onOpenApp(WebAppSessionKey(nodeId: server.nodeId, app: app.name))
-                        } label: {
-                            appRow(app)
+                    ContentUnavailableView {
+                        Label("No Apps", systemImage: "app.badge")
+                    } description: {
+                        Text("Refresh to scan the server for apps. If none appear, make sure they're running on the computer.")
+                    } actions: {
+                        Button("Scan Again") {
+                            Task { await refresh() }
                         }
-                        .buttonStyle(.plain)
+                        .disabled(isRefreshing)
                     }
+                } else {
+                    LazyVGrid(columns: appColumns, spacing: 14) {
+                        ForEach(apps) { app in
+                            appTile(app)
+                        }
+                    }
+                    .padding(.vertical, 6)
                 }
             }
         }
+        .refreshable { await refresh() }
         .navigationTitle(displayTitle)
         .toolbar {
             // One "…" menu for all server actions — add future actions here.
@@ -123,6 +134,15 @@ struct ServerDetailView: View {
                         Task { await prepareInvite() }
                     }
                     .disabled(isCreatingInvitation || isRefreshing)
+
+                    Divider()
+
+                    Button("Server Info…", systemImage: "info.circle") {
+                        showServerInfo = true
+                    }
+                    Button("Connection Logs", systemImage: "waveform.path.ecg") {
+                        showConnectionLogs = true
+                    }
                 } label: {
                     // Any server action in flight spins the icon, so it is
                     // always obvious that something is happening.
@@ -151,7 +171,7 @@ struct ServerDetailView: View {
             Text(aliasFooter)
         }
         .alert("Launch URL", isPresented: .constant(launchPrompt != nil)) {
-            TextField("http://127.0.0.1:3080/?token=…", text: $launchText)
+            TextField("/?token=…", text: $launchText)
                 .textInputAutocapitalization(.never)
                 .autocorrectionDisabled()
             Button("Cancel", role: .cancel) { launchPrompt = nil }
@@ -207,6 +227,9 @@ struct ServerDetailView: View {
         }
         .sheet(isPresented: $showConnectionLogs) {
             ConnectionLogView(nodeId: server.nodeId, title: displayTitle, monitor: monitor)
+        }
+        .sheet(isPresented: $showServerInfo) {
+            ServerInfoView(title: displayTitle, nodeId: server.nodeId, appCount: apps.count)
         }
         .task(id: server.nodeId) {
             // Establish/probe the serve connection so the indicator reflects
@@ -352,46 +375,52 @@ struct ServerDetailView: View {
         monitor.state(for: server.nodeId)
     }
 
+    /// The quiet connection line: a dot and one word — plus the reason, only
+    /// when there is one — with a retry button that appears only when
+    /// disconnected. The *text block* is the long-press target for Connection
+    /// Logs, deliberately separate from the button so tap and long-press can
+    /// never fight over the same area.
     @ViewBuilder
-    private var connectionRow: some View {
-        VStack(alignment: .leading, spacing: 4) {
+    private var statusLine: some View {
+        HStack(spacing: 8) {
             HStack(spacing: 8) {
                 Circle()
                     .fill(statusColor)
-                    .frame(width: 10, height: 10)
-                Text("Connection")
-                Spacer()
-                Text(statusText)
-                    .foregroundStyle(.secondary)
-                if case .disconnected = connectionState {
-                    Button {
-                        Task { await irohService.validateConnection(nodeId: server.nodeId) }
-                    } label: {
-                        Image(systemName: "arrow.clockwise")
+                    .frame(width: 9, height: 9)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(statusText)
+                        .font(.subheadline)
+                    if case .disconnected(let reason) = connectionState,
+                       let reason, !reason.isEmpty {
+                        Text(reason)
+                            .font(.caption)
+                            .lineLimit(2)
                     }
-                    .buttonStyle(.bordered)
-                    .buttonBorderShape(.circle)
-                    .controlSize(.small)
-                    .accessibilityLabel("Reconnect")
                 }
             }
-
-            if case .disconnected(let reason) = connectionState,
-               let reason, !reason.isEmpty {
-                Text(reason)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+            .foregroundStyle(.secondary)
+            .contentShape(Rectangle())
+            .onLongPressGesture {
+                showConnectionLogs = true
             }
-        }
-        // Hidden diagnosis: long-pressing the Connection row opens a live view
-        // of the captured connection log. Deliberately undiscoverable — there
-        // is no visible affordance.
-        .contentShape(Rectangle())
-        .onLongPressGesture {
-            showConnectionLogs = true
-        }
-        .accessibilityAction(named: "Connection Logs") {
-            showConnectionLogs = true
+            .accessibilityElement(children: .combine)
+            .accessibilityAction(named: "Connection Logs") {
+                showConnectionLogs = true
+            }
+
+            Spacer(minLength: 8)
+
+            if case .disconnected = connectionState {
+                Button {
+                    Task { await irohService.validateConnection(nodeId: server.nodeId) }
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .buttonStyle(.bordered)
+                .buttonBorderShape(.circle)
+                .controlSize(.small)
+                .accessibilityLabel("Reconnect")
+            }
         }
     }
 
@@ -429,39 +458,43 @@ struct ServerDetailView: View {
         return "Give this server a name you'll recognize. Leave empty to use its own name."
     }
 
-    private func appRow(_ app: AppInfo) -> some View {
-        HStack(spacing: 10) {
-            AppIconView(nodeId: server.nodeId, app: app.name, service: irohService)
-            VStack(alignment: .leading, spacing: 4) {
-                HStack(spacing: 6) {
-                    // Green dot = the app is running in the background; tapping
-                    // resumes it warm instead of reconnecting/reopening.
-                    if sessionManager.isRunning(nodeId: server.nodeId, app: app.name) {
-                        Circle()
-                            .fill(.green)
-                            .frame(width: 8, height: 8)
-                            .accessibilityLabel("Running")
+    /// One app as a tile: the circular icon (the same shape language as the
+    /// recent chips) with its name below. No port, no chevron — the icon and
+    /// name *are* the affordance. Green dot = running in the background
+    /// (tapping resumes it warm); a link badge = a launch URL is set.
+    private func appTile(_ app: AppInfo) -> some View {
+        let running = sessionManager.isRunning(nodeId: server.nodeId, app: app.name)
+        let hasLaunch = launchPaths[app.name] != nil
+        return Button {
+            onOpenApp(WebAppSessionKey(nodeId: server.nodeId, app: app.name))
+        } label: {
+            VStack(spacing: 8) {
+                AppIconView(nodeId: server.nodeId, app: app.name, service: irohService, size: 52)
+                    .overlay(alignment: .topTrailing) {
+                        if running { runningDot }
                     }
-                    Text(app.name)
-                        .font(.headline)
-                    if launchPaths[app.name] != nil {
-                        Image(systemName: "link")
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(.secondary)
-                            .accessibilityLabel("Opens with a launch URL")
+                    .overlay(alignment: .bottomTrailing) {
+                        if hasLaunch { launchBadge }
                     }
-                }
-                Text("\(app.port)")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                Text(app.name)
+                    .font(.callout.weight(.medium))
+                    .multilineTextAlignment(.center)
+                    .lineLimit(2)
+                    .minimumScaleFactor(0.85)
+                    .frame(maxWidth: .infinity)
             }
-            Spacer(minLength: 0)
-            Image(systemName: "chevron.forward")
-                .font(.footnote.weight(.semibold))
-                .foregroundStyle(.tertiary)
+            .padding(.vertical, 14)
+            .padding(.horizontal, 8)
+            .frame(maxWidth: .infinity)
+            .background(
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .fill(Color(uiColor: .tertiarySystemFill))
+            )
+            .contentShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
         }
-        .contentShape(Rectangle())
-        .padding(.vertical, 4)
+        .buttonStyle(.plain)
+        .accessibilityLabel(running ? "\(app.name), running" : app.name)
+        .accessibilityHint(hasLaunch ? "Opens with a launch URL" : "")
         .contextMenu {
             Button("Launch URL…", systemImage: "link") {
                 launchText = launchPaths[app.name] ?? ""
@@ -473,11 +506,66 @@ struct ServerDetailView: View {
                     launchPaths[app.name] = nil
                 }
             }
-            if sessionManager.isRunning(nodeId: server.nodeId, app: app.name) {
+            if running {
                 Button("Close Running App", role: .destructive) {
                     sessionManager.close(nodeId: server.nodeId, app: app.name)
                 }
             }
         }
+    }
+
+    /// Green running dot, stroked in the tile's own background colour so it
+    /// reads as punched out of the icon rather than floating over it.
+    private var runningDot: some View {
+        Circle()
+            .fill(.green)
+            .frame(width: 13, height: 13)
+            .overlay(
+                Circle().strokeBorder(
+                    Color(uiColor: .tertiarySystemFill),
+                    lineWidth: 2.5
+                )
+            )
+            .offset(x: 4, y: -4)
+            .accessibilityHidden(true)
+    }
+
+    /// The launch-URL badge, bottom-right of the icon.
+    private var launchBadge: some View {
+        Image(systemName: "link")
+            .font(.system(size: 10, weight: .bold))
+            .foregroundStyle(.secondary)
+            .padding(4)
+            .background(Circle().fill(Color(uiColor: .systemBackground)))
+            .overlay(Circle().strokeBorder(.separator, lineWidth: 0.5))
+            .offset(x: 4, y: 4)
+            .accessibilityHidden(true)
+    }
+}
+
+#Preview("Server detail") {
+    let service = IrohService(monitor: IrohConnectionMonitor())
+    let server = Server(
+        nodeId: "abcdef0123456789",
+        name: "Mac mini",
+        reportedName: "mac-mini.local",
+        apps: [
+            AppInfo(name: "jellyfin", path: "/", port: 8096, icon: "/favicon.ico"),
+            AppInfo(name: "home-assistant", path: "/", port: 8123),
+            AppInfo(name: "a-very-long-application-name", path: "/", port: 3000),
+            AppInfo(name: "dsh", path: "/", port: 8080),
+        ]
+    )
+    NavigationStack {
+        ServerDetailView(
+            server: server,
+            irohService: service,
+            monitor: IrohConnectionMonitor(),
+            sessionManager: WebAppSessionManager(service: service),
+            onAppsUpdated: { _ in },
+            onAliasChange: { _ in },
+            onReportedName: { _ in },
+            onOpenApp: { _ in }
+        )
     }
 }

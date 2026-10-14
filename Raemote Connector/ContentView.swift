@@ -383,9 +383,6 @@ struct ContentView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
-            Text(server.nodeId.prefix(16) + "...")
-                .font(.caption)
-                .foregroundStyle(.secondary)
             Text("\(server.apps.count) app\(server.apps.count == 1 ? "" : "s")")
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
