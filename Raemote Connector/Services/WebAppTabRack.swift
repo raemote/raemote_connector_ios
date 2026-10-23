@@ -149,6 +149,22 @@ final class WebAppTabRack {
         destroy(for: key)
     }
 
+    /// Rebuild `key`'s page in place, keeping it the visible tab.
+    ///
+    /// `SFSafariViewController` has no `reload()`, and a page that went through
+    /// a suspension can be a dead snapshot whose own reload button does
+    /// nothing (Safari's web process is not this app's). Dropping the
+    /// controller and creating a fresh one from `url` is the only reliable
+    /// repair, and it is exactly what the next mount would do — the rest of the
+    /// rack, including every other tab, is untouched.
+    func reload(for key: WebAppSessionKey, url: URL) {
+        let wasActive = activeKey == key
+        destroy(for: key)
+        if wasActive { activeKey = key }
+        _ = controller(for: key, url: url)
+        updateVisibility()
+    }
+
     func hasController(for key: WebAppSessionKey) -> Bool {
         controllers[key] != nil
     }

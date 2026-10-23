@@ -149,6 +149,11 @@ actor IrohService {
     private static let endpointRebuildCooldown: TimeInterval = 300
     /// Open stream count per node (a live tunnel keeps its connection fresh).
     private var openStreams: [String: Int] = [:]
+    /// When each node's connection was last retired or replaced. A warm page
+    /// compares this with the moment it was suspended: a replacement while the
+    /// app was away means the page was riding a connection that no longer
+    /// exists, so the page is stale even though it still draws.
+    private var lastReplaced: [String: Date] = [:]
 
     /// A live serve connection bound to the node it belongs to, stamped with
     /// the last time it carried traffic.
@@ -361,6 +366,13 @@ actor IrohService {
         }
     }
 
+    /// When `nodeId`'s connection was last retired or replaced. A caller that
+    /// holds state built on the old connection — a warm web page, above all —
+    /// uses this to tell whether that state is stale.
+    func lastReplacedAt(nodeId: String) -> Date? {
+        lastReplaced[nodeId]
+    }
+
     /// The cached connection for `nodeId`, but only when it is alive and either
     /// recently used or carrying an open stream. A stale entry is retired here
     /// (and closed, so the server drops it immediately) and `nil` returned, so
@@ -394,6 +406,14 @@ actor IrohService {
         connections[nodeId] = nil
         watchers[nodeId]?.cancel()
         watchers[nodeId] = nil
+        // This connection's streams died with it. Clearing the count matters:
+        // `ConnectionFreshness` trusts any connection that has an open stream,
+        // so a count left behind by a tunnel whose read can never return (see
+        // `ProxyTunnel.pumpToClient`) would make a *dead* connection look
+        // permanently fresh — every later request would ride the zombie until
+        // its 15 s watchdog fired.
+        openStreams[nodeId] = nil
+        lastReplaced[nodeId] = .now
         try? current.conn.close(errorCode: 0, reason: Data(reason.utf8))
         return true
     }
@@ -511,6 +531,7 @@ actor IrohService {
             )
         }
         connections[nodeId] = ServeConnection(nodeId: nodeId, conn: conn, lastUsed: .now)
+        lastReplaced[nodeId] = .now
         watchers[nodeId]?.cancel()
         // The watcher is bound to THIS connection, not the node key: if the
         // connection drops after a reconnect already adopted a newer one, the
@@ -531,6 +552,9 @@ actor IrohService {
         connections[nodeId] = nil
         watchers[nodeId]?.cancel()
         watchers[nodeId] = nil
+        // Its streams are gone with it (see `retire`).
+        openStreams[nodeId] = nil
+        lastReplaced[nodeId] = .now
         log("serve connection dropped: \(reason)", nodeId: nodeId)
         // Recorded for *this* node only, so a drop on one server never shows up
         // as another server's state.

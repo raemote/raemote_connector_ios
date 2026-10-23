@@ -29,6 +29,13 @@ struct AppHostView: View {
     /// Why the loopback proxy could not start, when it could not.
     @State private var proxyError: String?
 
+    /// When each app's page was last confirmed to be riding the live
+    /// connection, keyed by the app (NodeId isolation: one app's page can never
+    /// vouch for another's). If the connection is replaced after this — a
+    /// suspension, a server restart, a network change — that page is stale even
+    /// though it still draws, and is rebuilt (see `revalidateAndRecover`).
+    @State private var pageValidatedAt: [WebAppSessionKey: Date] = [:]
+
     var body: some View {
         Group {
             if let key = sessionManager.activeKey,
@@ -91,12 +98,19 @@ struct AppHostView: View {
             await connectThenStart(key: key, session: session)
         }
         .onChange(of: scenePhase) { _, phase in
+            // Returning to the foreground is the moment a suspended app's
+            // connection (and Safari's web process) turns out to be gone.
             guard phase == .active else { return }
-            Task { await irohService.validateConnection(nodeId: key.nodeId) }
+            Task { await revalidateAndRecover(key: key, session: session) }
         }
         .onChange(of: connectionState(for: key)) { _, newState in
-            if case .connected = newState, session.proxyURL == nil {
+            guard case .connected = newState else { return }
+            if session.proxyURL == nil {
                 Task { await startProxy(key: key, session: session) }
+            } else {
+                // The connection came back under a live page, whose tunnels
+                // rode the old one. Same repair as a foreground return.
+                Task { await revalidateAndRecover(key: key, session: session) }
             }
         }
         // No teardown on disappear: background sessions (and their warm tabs)
@@ -182,10 +196,11 @@ struct AppHostView: View {
     /// Wait for a live connection, then bring up the loopback proxy. Retries
     /// until connected (or the task is cancelled by a key switch / the screen
     /// going away). Re-presenting a running app skips the wait: the proxy is
-    /// already up.
+    /// already up, and `revalidateAndRecover` repairs the page if the
+    /// connection was replaced while it was off screen.
     private func connectThenStart(key: WebAppSessionKey, session: WebAppSession) async {
         if session.proxyURL != nil {
-            await irohService.validateConnection(nodeId: key.nodeId)
+            await revalidateAndRecover(key: key, session: session)
             return
         }
         while !Task.isCancelled {
@@ -197,6 +212,39 @@ struct AppHostView: View {
         await startProxy(key: key, session: session)
     }
 
+    /// Reconnect, and repair a page that outlived its connection.
+    ///
+    /// A backgrounded app loses its serve connection (QUIC idle timeout, or the
+    /// server noticing the peer is gone). Safari's view keeps drawing — and
+    /// after a long enough suspension its web process may be gone too, in which
+    /// case the page's own reload does nothing at all. Either way the page is
+    /// stale: its tunnels rode the connection that no longer exists, so
+    /// switching to it shows a screen that can neither refresh nor navigate.
+    ///
+    /// Rebuilding over the (still warm) loopback proxy fixes both: same origin,
+    /// same cookies and site data, a live page on the re-established
+    /// connection. Only a connection that was actually replaced since the page
+    /// was last confirmed live triggers it, so a quick app switch keeps its
+    /// page state.
+    private func revalidateAndRecover(
+        key: WebAppSessionKey,
+        session: WebAppSession
+    ) async {
+        await irohService.validateConnection(nodeId: key.nodeId)
+        guard case .connected = connectionState(for: key),
+              sessionManager.isRunning(key),
+              let url = session.proxyURL else { return }
+        if let replacedAt = await irohService.lastReplacedAt(nodeId: key.nodeId),
+           replacedAt > pageValidatedAt[key] ?? .distantPast {
+            ConnectionLog.shared.append(
+                "page rebuilt: the connection was replaced after it loaded",
+                nodeId: key.nodeId
+            )
+            sessionManager.rack.reload(for: key, url: url)
+        }
+        pageValidatedAt[key] = .now
+    }
+
     private func startProxy(key: WebAppSessionKey, session: WebAppSession) async {
         guard session.proxyURL == nil else { return }
         guard case .connected = connectionState(for: key) else { return }
@@ -206,6 +254,7 @@ struct AppHostView: View {
             let launchPath = AppLaunchStore.path(nodeId: key.nodeId, app: key.app)
             _ = try await sessionManager.ensureProxy(for: session, launchPath: launchPath)
             proxyError = nil
+            pageValidatedAt[key] = .now
         } catch {
             proxyError = error.localizedDescription
         }

@@ -222,6 +222,40 @@ struct WebAppTabRackTests {
         #expect(counter.n == 2, "a fresh controller, not a stale one")
     }
 
+    /// A page that outlived its connection is rebuilt in place: a fresh
+    /// controller on the same key and URL, every other tab untouched. This is
+    /// the repair for the reported bug — background the app, come back and
+    /// reconnect, and the old page sat there unable to refresh or navigate,
+    /// because its tunnels rode the connection that no longer exists.
+    @Test func reloadRebuildsThatPageAndKeepsTheRestOfTheRack() {
+        let (rack, counter) = makeRack()
+        let key = WebAppSessionKey(nodeId: "n", app: "a")
+        let other = WebAppSessionKey(nodeId: "n", app: "b")
+        let stale = rack.controller(for: key, url: url())
+        _ = rack.controller(for: other, url: url())
+        rack.tabDidLoad(key, didLoad: true)
+        #expect(rack.controllerCount == 2)
+
+        rack.reload(for: key, url: url())
+
+        #expect(rack.hasController(for: key))
+        #expect(rack.controller(for: key, url: url()) !== stale, "a fresh page, not the stale one")
+        #expect(rack.loadState(for: key) == .loading, "the rebuilt page loads again")
+        #expect(rack.hasController(for: other), "other tabs survive")
+        #expect(counter.n == 3)
+    }
+
+    /// Reloading a key with no page is harmless: it simply creates one.
+    @Test func reloadOfAnAbsentPageCreatesIt() {
+        let (rack, counter) = makeRack()
+        let key = WebAppSessionKey(nodeId: "n", app: "a")
+
+        rack.reload(for: key, url: url())
+
+        #expect(counter.n == 1)
+        #expect(rack.hasController(for: key))
+    }
+
     @Test func staleLoadCallbacksAreIgnored() {
         let (rack, _) = makeRack()
         let key = WebAppSessionKey(nodeId: "n", app: "a")
