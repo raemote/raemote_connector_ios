@@ -10,6 +10,12 @@ enum Route: Hashable {
     case app
 }
 
+/// The root's two tabs: apps the user has used, and the servers they live on.
+enum RootTab: Hashable {
+    case recent
+    case paired
+}
+
 struct ContentView: View {
     @State private var servers: [Server] = []
     @State private var isBinding = false
@@ -27,6 +33,11 @@ struct ContentView: View {
     /// sessions keep running when the user navigates away from them.
     @State private var sessionManager: WebAppSessionManager
     @State private var path: [Route] = []
+    /// Which root tab is showing. Starts on **Recent** when there is history,
+    /// on **Paired** otherwise (a first-run user has servers to find, not
+    /// recents to revisit).
+    @State private var selectedTab: RootTab = .recent
+    @State private var didChooseInitialTab = false
     @State private var pendingDeepLink: DeepLink?
     /// Set once after the first successful pairing, to show the network tip.
     @State private var firstPairingName: String?
@@ -47,12 +58,12 @@ struct ContentView: View {
 
     var body: some View {
         NavigationStack(path: $path) {
-            List {
-                // Recently opened apps across every paired server, most recent
-                // first; a running one carries a green dot and the rest are kept
-                // so a stopped app is one tap away. Compact: a single row.
-                if !RecentAppStore.shared.entries.isEmpty {
-                    RecentAppsSection(
+            // Two tabs — Recent and Paired — with the system's Liquid Glass tab
+            // bar at the bottom. It minimises itself while a tab's list
+            // scrolls, which is the behaviour people now expect from a scroll.
+            TabView(selection: $selectedTab) {
+                Tab("Recent", systemImage: "clock.arrow.circlepath", value: RootTab.recent) {
+                    RecentAppsView(
                         entries: RecentAppStore.shared.entries,
                         servers: servers,
                         sessionManager: sessionManager,
@@ -60,22 +71,16 @@ struct ContentView: View {
                         onOpen: { openApp($0) }
                     )
                 }
-                if servers.isEmpty {
-                    ContentUnavailableView(
-                        "No Servers Yet",
-                        systemImage: "server.rack",
-                        description: Text("On your computer, run “raemote pair”, then tap + and scan the QR code.")
-                    )
-                } else {
-                    ForEach(servers) { server in
-                        NavigationLink(value: Route.server(server)) {
-                            serverRow(server)
-                        }
-                    }
-                    .onDelete(perform: deleteServers)
+                Tab("Paired", systemImage: "server.rack", value: RootTab.paired) {
+                    pairedList
                 }
             }
-            .navigationTitle("Raemote")
+            .modifier(MinimizingTabBar())
+            // No title: the screen is the recent row and the server list. An
+            // empty inline bar keeps the "+" button without the large-title
+            // block that used to sit above everything.
+            .navigationTitle("")
+            .navigationBarTitleDisplayMode(.inline)
             .navigationDestination(for: Route.self) { route in
                 destination(for: route)
             }
@@ -156,6 +161,12 @@ struct ContentView: View {
             }
             .task {
                 loadServers()
+                if !didChooseInitialTab {
+                    didChooseInitialTab = true
+                    if RecentAppStore.shared.entries.isEmpty {
+                        selectedTab = .paired
+                    }
+                }
                 if let link = pendingDeepLink {
                     resolve(link)
                 }
@@ -166,6 +177,40 @@ struct ContentView: View {
                 Task { await refreshCatalogsIfStale() }
             }
             .onOpenURL { handleDeepLink($0) }
+        }
+    }
+
+    /// The iOS 26 tab bar hides itself while the list scrolls — the behaviour
+    /// the system's own apps show. Guarded because the app still deploys back
+    /// to 18.6, where the bar simply stays put.
+    private struct MinimizingTabBar: ViewModifier {
+        func body(content: Content) -> some View {
+            if #available(iOS 26.0, *) {
+                content.tabBarMinimizeBehavior(.onScrollDown)
+            } else {
+                content
+            }
+        }
+    }
+
+    /// The **Paired** tab: one row per known server. Tapping one opens its app
+    /// catalog; swiping deletes it.
+    private var pairedList: some View {
+        List {
+            if servers.isEmpty {
+                ContentUnavailableView(
+                    "No Servers Yet",
+                    systemImage: "server.rack",
+                    description: Text("On your computer, run “raemote pair”, then tap + and scan the QR code.")
+                )
+            } else {
+                ForEach(servers) { server in
+                    NavigationLink(value: Route.server(server)) {
+                        serverRow(server)
+                    }
+                }
+                .onDelete(perform: deleteServers)
+            }
         }
     }
 
@@ -324,6 +369,8 @@ struct ContentView: View {
                 }
                 AppIconStore.shared.register(nodeId: nodeId, apps: apps)
                 saveServers()
+                // Show the server that was just paired.
+                selectedTab = .paired
 
                 if isFirstPairing, OnboardingStore.shouldShowNetworkTip() {
                     OnboardingStore.markNetworkTipShown()
