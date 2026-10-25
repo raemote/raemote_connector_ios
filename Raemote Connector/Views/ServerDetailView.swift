@@ -46,9 +46,6 @@ struct ServerDetailView: View {
     /// main screen.
     @State private var showServerInfo = false
 
-    /// Tile grid columns: narrow phones get two columns, wide screens more.
-    private let appColumns = [GridItem(.adaptive(minimum: 104), spacing: 14)]
-
     /// A minted invitation presented in a sheet.
     private struct InvitationPresentation: Identifiable {
         let id = UUID()
@@ -104,12 +101,9 @@ struct ServerDetailView: View {
                         .disabled(isRefreshing)
                     }
                 } else {
-                    LazyVGrid(columns: appColumns, spacing: 14) {
-                        ForEach(apps) { app in
-                            appTile(app)
-                        }
+                    ForEach(apps) { app in
+                        appRow(app)
                     }
-                    .padding(.vertical, 6)
                 }
             }
         }
@@ -458,39 +452,33 @@ struct ServerDetailView: View {
         return "Give this server a name you'll recognize. Leave empty to use its own name."
     }
 
-    /// One app as a tile: the circular icon (the same shape language as the
-    /// recent chips) with its name below. No port, no chevron — the icon and
-    /// name *are* the affordance. Green dot = running in the background
-    /// (tapping resumes it warm); a link badge = a launch URL is set.
-    private func appTile(_ app: AppInfo) -> some View {
+    /// One app, one line: the circular icon, the name, and — only when they
+    /// apply — a green running dot and the launch-URL link. No port, no
+    /// chevron: the row *is* the affordance, and a plain list stays scannable
+    /// however many apps the server runs.
+    private func appRow(_ app: AppInfo) -> some View {
         let running = sessionManager.isRunning(nodeId: server.nodeId, app: app.name)
         let hasLaunch = launchPaths[app.name] != nil
         return Button {
             onOpenApp(WebAppSessionKey(nodeId: server.nodeId, app: app.name))
         } label: {
-            VStack(spacing: 8) {
-                AppIconView(nodeId: server.nodeId, app: app.name, service: irohService, size: 52)
+            HStack(spacing: 12) {
+                AppIconView(nodeId: server.nodeId, app: app.name, service: irohService, size: 32)
                     .overlay(alignment: .topTrailing) {
                         if running { runningDot }
                     }
-                    .overlay(alignment: .bottomTrailing) {
-                        if hasLaunch { launchBadge }
-                    }
                 Text(app.name)
-                    .font(.callout.weight(.medium))
-                    .multilineTextAlignment(.center)
-                    .lineLimit(2)
-                    .minimumScaleFactor(0.85)
-                    .frame(maxWidth: .infinity)
+                    .font(.body)
+                    .lineLimit(1)
+                Spacer(minLength: 8)
+                if hasLaunch {
+                    Image(systemName: "link")
+                        .font(.footnote.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                }
             }
-            .padding(.vertical, 14)
-            .padding(.horizontal, 8)
-            .frame(maxWidth: .infinity)
-            .background(
-                RoundedRectangle(cornerRadius: 16, style: .continuous)
-                    .fill(Color(uiColor: .tertiarySystemFill))
-            )
-            .contentShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+            .padding(.vertical, 4)
+            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .accessibilityLabel(running ? "\(app.name), running" : app.name)
@@ -514,31 +502,19 @@ struct ServerDetailView: View {
         }
     }
 
-    /// Green running dot, stroked in the tile's own background colour so it
-    /// reads as punched out of the icon rather than floating over it.
+    /// Green running dot on the icon's corner. A hairline halo in the system
+    /// background keeps it legible over a bright favicon.
     private var runningDot: some View {
         Circle()
             .fill(.green)
-            .frame(width: 13, height: 13)
+            .frame(width: 11, height: 11)
             .overlay(
                 Circle().strokeBorder(
-                    Color(uiColor: .tertiarySystemFill),
-                    lineWidth: 2.5
+                    Color(uiColor: .systemBackground),
+                    lineWidth: 2
                 )
             )
-            .offset(x: 4, y: -4)
-            .accessibilityHidden(true)
-    }
-
-    /// The launch-URL badge, bottom-right of the icon.
-    private var launchBadge: some View {
-        Image(systemName: "link")
-            .font(.system(size: 10, weight: .bold))
-            .foregroundStyle(.secondary)
-            .padding(4)
-            .background(Circle().fill(Color(uiColor: .systemBackground)))
-            .overlay(Circle().strokeBorder(.separator, lineWidth: 0.5))
-            .offset(x: 4, y: 4)
+            .offset(x: 3, y: -3)
             .accessibilityHidden(true)
     }
 }
